@@ -32,7 +32,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 APP_NAME = "NovaLauncher"
-APP_VERSION = "0.1"
+APP_VERSION = "0.2"
 UA = f"{APP_NAME}/{APP_VERSION}"
 
 MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
@@ -570,7 +570,7 @@ def total_ram_mb():
 
 
 DEFAULT_CONFIG = {"username": "Player", "version": "", "ram_mb": 4096,
-                  "snapshots": False, "old": False}
+                  "snapshots": False, "old": False, "minimize": False}
 
 
 def load_config():
@@ -593,16 +593,65 @@ def save_config(cfg):
 # Interfaz
 # --------------------------------------------------------------------------
 def run_gui():
+    import random
     import tkinter as tk
     from tkinter import ttk, messagebox
 
-    BG, CARD, FG, MUTED = "#0f1117", "#181b24", "#e8eaf0", "#8b90a0"
-    ACCENT, GREEN, GREEN_H = "#5b8cff", "#2fbf71", "#3bd983"
+    BG, SIDE, CARD, CARD2, LINE = "#0d0f14", "#11141b", "#171b25", "#202636", "#262c3b"
+    FG, MUTED, ACCENT = "#e9ecf4", "#8a90a2", "#5b8cff"
+    GREEN, GREEN_H, DIS = "#2fbf71", "#3bd983", "#262b38"
+    FONT = "Segoe UI"
+
+    def blend(c1, c2, t):
+        a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+        b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+        return "#%02x%02x%02x" % tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+    class RoundButton(tk.Canvas):
+        """Botón con esquinas redondeadas."""
+
+        def __init__(self, parent, text, command, color, hover, parent_bg,
+                     font=(FONT, 15, "bold"), height=54, radius=14, fg="white"):
+            super().__init__(parent, height=height, bg=parent_bg, highlightthickness=0,
+                             bd=0, cursor="hand2")
+            self.text, self.command, self.color, self.hover = text, command, color, hover
+            self.fg, self.font, self.r = fg, font, radius
+            self.enabled, self.over = True, False
+            self.bind("<Configure>", lambda e: self.draw())
+            self.bind("<Enter>", lambda e: self._set_over(True))
+            self.bind("<Leave>", lambda e: self._set_over(False))
+            self.bind("<ButtonRelease-1>", self._click)
+
+        def _set_over(self, v):
+            self.over = v
+            self.draw()
+
+        def _click(self, _):
+            if self.enabled and self.command:
+                self.command()
+
+        def set_state(self, text, enabled):
+            self.text, self.enabled = text, enabled
+            self.configure(cursor="hand2" if enabled else "arrow")
+            self.draw()
+
+        def draw(self):
+            self.delete("all")
+            w, h, r = self.winfo_width(), self.winfo_height(), self.r
+            if w < 4:
+                return
+            fill = DIS if not self.enabled else (self.hover if self.over else self.color)
+            x1, y1, x2, y2 = 1, 1, w - 1, h - 1
+            pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+                   x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+            self.create_polygon(pts, smooth=True, fill=fill, outline=fill)
+            self.create_text(w / 2, h / 2, text=self.text, font=self.font,
+                             fill=self.fg if self.enabled else MUTED)
 
     root = tk.Tk()
     root.title(f"{APP_NAME} {APP_VERSION}")
-    root.geometry("760x620")
-    root.minsize(680, 560)
+    root.geometry("960x640")
+    root.minsize(880, 580)
     root.configure(bg=BG)
 
     style = ttk.Style()
@@ -610,104 +659,75 @@ def run_gui():
         style.theme_use("clam")
     except tk.TclError:
         pass
-    style.configure("TCombobox", fieldbackground=CARD, background=CARD, foreground=FG,
-                    arrowcolor=FG, bordercolor=CARD, lightcolor=CARD, darkcolor=CARD)
-    style.map("TCombobox", fieldbackground=[("readonly", CARD)], foreground=[("readonly", FG)])
-    style.configure("Horizontal.TProgressbar", troughcolor=CARD, background=ACCENT,
-                    bordercolor=CARD, lightcolor=ACCENT, darkcolor=ACCENT)
-    style.configure("TScale", background=BG, troughcolor=CARD)
-    root.option_add("*TCombobox*Listbox.background", CARD)
+    style.configure("TCombobox", fieldbackground=CARD2, background=CARD2, foreground=FG,
+                    arrowcolor=FG, bordercolor=LINE, lightcolor=CARD2, darkcolor=CARD2,
+                    selectbackground=CARD2, selectforeground=FG)
+    style.map("TCombobox", fieldbackground=[("readonly", CARD2)],
+              foreground=[("readonly", FG)], selectbackground=[("readonly", CARD2)])
+    style.configure("Nova.Horizontal.TProgressbar", troughcolor=CARD, background=ACCENT,
+                    bordercolor=CARD, lightcolor=ACCENT, darkcolor=ACCENT, thickness=8)
+    style.configure("Nova.Horizontal.TScale", background=CARD, troughcolor=CARD2)
+    root.option_add("*TCombobox*Listbox.background", CARD2)
     root.option_add("*TCombobox*Listbox.foreground", FG)
     root.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
+    root.option_add("*TCombobox*Listbox.font", (FONT, 11))
 
     cfg = load_config()
     msgs = queue.Queue()
-    state = {"manifest": None, "busy": False}
+    state = {"manifest": None, "busy": False, "page": "play"}
 
-    # --- cabecera
-    header = tk.Frame(root, bg=BG)
-    header.pack(fill="x", padx=28, pady=(24, 6))
-    tk.Label(header, text="NOVA", font=("Segoe UI", 26, "bold"), fg=ACCENT, bg=BG).pack(side="left")
-    tk.Label(header, text="LAUNCHER", font=("Segoe UI", 26), fg=FG, bg=BG).pack(side="left", padx=(6, 0))
-    tk.Label(header, text="Minecraft Java Edition", font=("Segoe UI", 10), fg=MUTED, bg=BG).pack(
-        side="left", padx=14, pady=(14, 0))
-
-    # --- tarjeta de ajustes
-    card = tk.Frame(root, bg=CARD)
-    card.pack(fill="x", padx=28, pady=10)
-    card.columnconfigure(1, weight=1)
-
-    def lbl(text, row):
-        tk.Label(card, text=text, font=("Segoe UI", 10), fg=MUTED, bg=CARD).grid(
-            row=row, column=0, sticky="w", padx=(18, 14), pady=10)
-
-    lbl("Usuario", 0)
     user_var = tk.StringVar(value=cfg["username"])
-    tk.Entry(card, textvariable=user_var, font=("Segoe UI", 11), bg=BG, fg=FG, insertbackground=FG,
-             relief="flat", highlightthickness=1, highlightbackground="#2a2f3d",
-             highlightcolor=ACCENT).grid(row=0, column=1, sticky="ew", padx=(0, 18), pady=10, ipady=5)
-
-    lbl("Versión", 1)
     ver_var = tk.StringVar(value=cfg["version"])
-    ver_box = ttk.Combobox(card, textvariable=ver_var, state="readonly", font=("Segoe UI", 11))
-    ver_box.grid(row=1, column=1, sticky="ew", padx=(0, 18), pady=10, ipady=3)
-
-    flt = tk.Frame(card, bg=CARD)
-    flt.grid(row=2, column=1, sticky="w", pady=(0, 6))
     snap_var = tk.BooleanVar(value=cfg["snapshots"])
     old_var = tk.BooleanVar(value=cfg["old"])
-    for text, var in (("Snapshots", snap_var), ("Versiones antiguas", old_var)):
-        tk.Checkbutton(flt, text=text, variable=var, command=lambda: refresh_versions(),
-                       fg=FG, bg=CARD, selectcolor=BG, activebackground=CARD, activeforeground=FG,
-                       font=("Segoe UI", 9), bd=0, highlightthickness=0).pack(side="left", padx=(0, 14))
-
-    lbl("Memoria RAM", 3)
+    min_var = tk.BooleanVar(value=cfg.get("minimize", False))
     max_ram = max(2048, min(32768, int(total_ram_mb() * 0.75)))
     ram_var = tk.IntVar(value=min(cfg["ram_mb"], max_ram))
     ram_text = tk.StringVar()
-    ram_row = tk.Frame(card, bg=CARD)
-    ram_row.grid(row=3, column=1, sticky="ew", padx=(0, 18), pady=(6, 16))
-
-    def on_ram(_=None):
-        v = int(round(float(ram_var.get()) / 256) * 256)
-        ram_var.set(v)
-        ram_text.set(f"{v / 1024:.2f} GB".replace(".00", ".0"))
-
-    ttk.Scale(ram_row, from_=1024, to=max_ram, variable=ram_var, command=on_ram).pack(
-        side="left", fill="x", expand=True)
-    tk.Label(ram_row, textvariable=ram_text, width=8, font=("Segoe UI", 10, "bold"),
-             fg=FG, bg=CARD).pack(side="left", padx=(12, 0))
-    on_ram()
-
-    # --- botón jugar
-    play_btn = tk.Button(root, text="JUGAR", font=("Segoe UI", 16, "bold"), bg=GREEN, fg="white",
-                         activebackground=GREEN_H, activeforeground="white", relief="flat",
-                         cursor="hand2", bd=0)
-    play_btn.pack(fill="x", padx=28, pady=(8, 4), ipady=10)
-    play_btn.bind("<Enter>", lambda e: play_btn.config(bg=GREEN_H) if not state["busy"] else None)
-    play_btn.bind("<Leave>", lambda e: play_btn.config(bg=GREEN) if not state["busy"] else None)
-
+    mode_var = tk.StringVar(value="Offline")
     status_var = tk.StringVar(value="Cargando versiones...")
-    tk.Label(root, textvariable=status_var, font=("Segoe UI", 9), fg=MUTED, bg=BG,
-             anchor="w").pack(fill="x", padx=30)
-    bar = ttk.Progressbar(root, mode="determinate", style="Horizontal.TProgressbar")
-    bar.pack(fill="x", padx=28, pady=(4, 8))
 
-    # --- consola
-    log_frame = tk.Frame(root, bg=CARD)
-    log_frame.pack(fill="both", expand=True, padx=28, pady=(0, 10))
-    log_text = tk.Text(log_frame, bg=CARD, fg="#b7bccb", font=("Consolas", 9), relief="flat",
-                       wrap="word", state="disabled", height=8, bd=0, padx=10, pady=8)
-    sb = tk.Scrollbar(log_frame, command=log_text.yview)
-    log_text.configure(yscrollcommand=sb.set)
-    sb.pack(side="right", fill="y")
-    log_text.pack(side="left", fill="both", expand=True)
+    # ------------------------------------------------------------------ barra lateral
+    sidebar = tk.Frame(root, bg=SIDE, width=210)
+    sidebar.pack(side="left", fill="y")
+    sidebar.pack_propagate(False)
 
-    footer = tk.Frame(root, bg=BG)
-    footer.pack(fill="x", padx=28, pady=(0, 14))
-    tk.Button(footer, text="Abrir carpeta del juego", font=("Segoe UI", 9), bg=CARD, fg=FG,
-              activebackground="#222634", activeforeground=FG, relief="flat", bd=0, cursor="hand2",
-              command=lambda: open_folder(GAME_DIR)).pack(side="left", ipadx=10, ipady=4)
+    logo = tk.Frame(sidebar, bg=SIDE)
+    logo.pack(fill="x", padx=20, pady=(26, 22))
+    tk.Label(logo, text="NOVA", font=(FONT, 22, "bold"), fg=ACCENT, bg=SIDE).pack(anchor="w")
+    tk.Label(logo, text="LAUNCHER", font=(FONT, 9, "bold"), fg=MUTED, bg=SIDE).pack(anchor="w")
+
+    nav = {}
+    pages = {}
+
+    def style_nav(name, hover=False):
+        row, bar, lab = nav[name]
+        active = state["page"] == name
+        bg = CARD if (active or hover) else SIDE
+        row.configure(bg=bg)
+        bar.configure(bg=ACCENT if active else bg)
+        lab.configure(bg=bg, fg=FG if (active or hover) else MUTED)
+
+    def make_nav(text, name):
+        row = tk.Frame(sidebar, bg=SIDE, cursor="hand2")
+        row.pack(fill="x", pady=1)
+        bar = tk.Frame(row, bg=SIDE, width=4)
+        bar.pack(side="left", fill="y")
+        lab = tk.Label(row, text=text, font=(FONT, 11), fg=MUTED, bg=SIDE, anchor="w",
+                       padx=16, pady=12)
+        lab.pack(side="left", fill="x", expand=True)
+        nav[name] = (row, bar, lab)
+        for w in (row, lab, bar):
+            w.bind("<Button-1>", lambda e, n=name: show_page(n))
+            w.bind("<Enter>", lambda e, n=name: style_nav(n, True))
+            w.bind("<Leave>", lambda e, n=name: style_nav(n, False))
+
+    make_nav("▶   Jugar", "play")
+    make_nav("⚙   Ajustes", "settings")
+    make_nav("≡   Consola", "console")
+
+    side_bottom = tk.Frame(sidebar, bg=SIDE)
+    side_bottom.pack(side="bottom", fill="x", padx=16, pady=16)
 
     def open_folder(path):
         os.makedirs(path, exist_ok=True)
@@ -718,13 +738,183 @@ def run_gui():
         else:
             subprocess.Popen(["xdg-open", path])
 
+    tk.Button(side_bottom, text="Abrir carpeta del juego", font=(FONT, 9), bg=CARD, fg=FG,
+              activebackground=CARD2, activeforeground=FG, relief="flat", bd=0, cursor="hand2",
+              command=lambda: open_folder(GAME_DIR)).pack(fill="x", ipady=7)
+    tk.Label(side_bottom, text=f"v{APP_VERSION}", font=(FONT, 8), fg=MUTED, bg=SIDE).pack(pady=(10, 0))
+
+    content = tk.Frame(root, bg=BG)
+    content.pack(side="left", fill="both", expand=True)
+
+    def card(parent, **kw):
+        return tk.Frame(parent, bg=CARD, highlightthickness=1, highlightbackground=LINE, **kw)
+
+    def small_title(parent, text, bg=CARD):
+        return tk.Label(parent, text=text, font=(FONT, 8, "bold"), fg=MUTED, bg=bg)
+
+    # ------------------------------------------------------------------ página JUGAR
+    play = tk.Frame(content, bg=BG)
+    pages["play"] = play
+
+    hero = tk.Canvas(play, height=210, bg=BG, highlightthickness=0)
+    hero.pack(fill="x")
+
+    def draw_hero(_=None):
+        w, h = hero.winfo_width(), hero.winfo_height()
+        if w < 10 or h < 10:
+            return
+        hero.delete("all")
+        top, bottom = "#274291", BG
+        for y in range(0, h, 2):
+            hero.create_line(0, y, w, y, fill=blend(top, bottom, y / h), width=2)
+        rng = random.Random(7)
+        size = 28
+        cols, rows = w // size + 1, h // size + 1
+        for cx in range(cols):
+            for cy in range(rows):
+                if rng.random() < (cx / cols) * 0.6:
+                    base = blend(top, bottom, min(1.0, (cy * size) / h))
+                    shade = blend(base, "#8fb0ff", 0.08 + 0.16 * rng.random())
+                    hero.create_rectangle(cx * size, cy * size, cx * size + size - 3,
+                                          cy * size + size - 3, fill=shade, outline="")
+        name = user_var.get().strip() or "Jugador"
+        ver = ver_var.get()
+        sub = f"Minecraft {ver}   ·   Modo offline" if ver else "Elegí una versión para empezar"
+        hero.create_text(40, h / 2 - 20, anchor="w", text=f"Hola, {name}", fill="white",
+                         font=(FONT, 30, "bold"))
+        hero.create_text(42, h / 2 + 24, anchor="w", text=sub, fill="#c5d3ff", font=(FONT, 12))
+
+    hero.bind("<Configure>", draw_hero)
+    user_var.trace_add("write", lambda *a: draw_hero())
+    ver_var.trace_add("write", lambda *a: draw_hero())
+
+    body = tk.Frame(play, bg=BG)
+    body.pack(fill="both", expand=True, padx=32, pady=(20, 10))
+
+    vcard = card(body)
+    vcard.pack(fill="x")
+    small_title(vcard, "VERSIÓN DE MINECRAFT").pack(anchor="w", padx=18, pady=(14, 6))
+    ver_box = ttk.Combobox(vcard, textvariable=ver_var, state="readonly", font=(FONT, 12))
+    ver_box.pack(fill="x", padx=18, pady=(0, 16), ipady=4)
+
+    stats = tk.Frame(body, bg=BG)
+    stats.pack(fill="x", pady=14)
+    for i in range(3):
+        stats.columnconfigure(i, weight=1, uniform="s")
+
+    def stat_card(col, title, var):
+        f = card(stats)
+        f.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 8, 0 if col == 2 else 8))
+        small_title(f, title).pack(anchor="w", padx=16, pady=(12, 0))
+        tk.Label(f, textvariable=var, font=(FONT, 14, "bold"), fg=FG, bg=CARD).pack(
+            anchor="w", padx=16, pady=(2, 12))
+
+    stat_card(0, "MEMORIA RAM", ram_text)
+    stat_card(1, "USUARIO", user_var)
+    stat_card(2, "MODO", mode_var)
+
+    play_btn = RoundButton(body, "JUGAR", lambda: on_play(), GREEN, GREEN_H, BG)
+    play_btn.pack(fill="x", pady=(4, 12))
+
+    tk.Label(body, textvariable=status_var, font=(FONT, 9), fg=MUTED, bg=BG, anchor="w").pack(fill="x")
+    bar = ttk.Progressbar(body, mode="determinate", style="Nova.Horizontal.TProgressbar")
+    bar.pack(fill="x", pady=(6, 0))
+
+    # ------------------------------------------------------------------ página AJUSTES
+    sett = tk.Frame(content, bg=BG)
+    pages["settings"] = sett
+    tk.Label(sett, text="Ajustes", font=(FONT, 22, "bold"), fg=FG, bg=BG).pack(
+        anchor="w", padx=32, pady=(28, 14))
+
+    c1 = card(sett)
+    c1.pack(fill="x", padx=32, pady=(0, 14))
+    small_title(c1, "NOMBRE DE USUARIO").pack(anchor="w", padx=18, pady=(14, 6))
+    tk.Entry(c1, textvariable=user_var, font=(FONT, 12), bg=CARD2, fg=FG, insertbackground=FG,
+             relief="flat", highlightthickness=1, highlightbackground=LINE,
+             highlightcolor=ACCENT).pack(fill="x", padx=18, pady=(0, 16), ipady=7)
+
+    c2 = card(sett)
+    c2.pack(fill="x", padx=32, pady=(0, 14))
+    small_title(c2, "MEMORIA RAM ASIGNADA").pack(anchor="w", padx=18, pady=(14, 6))
+    ram_row = tk.Frame(c2, bg=CARD)
+    ram_row.pack(fill="x", padx=18, pady=(0, 16))
+
+    def on_ram(_=None):
+        v = int(round(float(ram_var.get()) / 256) * 256)
+        ram_var.set(v)
+        ram_text.set(f"{v / 1024:.1f} GB")
+
+    ttk.Scale(ram_row, from_=1024, to=max_ram, variable=ram_var, command=on_ram,
+              style="Nova.Horizontal.TScale").pack(side="left", fill="x", expand=True)
+    tk.Label(ram_row, textvariable=ram_text, width=8, font=(FONT, 11, "bold"), fg=FG,
+             bg=CARD).pack(side="left", padx=(14, 0))
+    on_ram()
+
+    c3 = card(sett)
+    c3.pack(fill="x", padx=32, pady=(0, 14))
+    small_title(c3, "OPCIONES").pack(anchor="w", padx=18, pady=(14, 4))
+
+    def check(parent, text, var, cmd=None):
+        tk.Checkbutton(parent, text=text, variable=var, command=cmd, fg=FG, bg=CARD,
+                       selectcolor=CARD2, activebackground=CARD, activeforeground=FG,
+                       font=(FONT, 10), bd=0, highlightthickness=0, anchor="w").pack(
+            fill="x", padx=14, pady=3)
+
+    check(c3, "Mostrar snapshots en la lista de versiones", snap_var, lambda: refresh_versions())
+    check(c3, "Mostrar versiones antiguas (beta / alpha)", old_var, lambda: refresh_versions())
+    check(c3, "Minimizar el launcher mientras juego", min_var)
+    tk.Frame(c3, bg=CARD, height=10).pack()
+
+    tk.Label(sett, text=f"Los datos del juego se guardan en:  {ROOT}", font=(FONT, 9), fg=MUTED,
+             bg=BG, anchor="w").pack(fill="x", padx=34, pady=(4, 0))
+
+    # ------------------------------------------------------------------ página CONSOLA
+    cons = tk.Frame(content, bg=BG)
+    pages["console"] = cons
+    head = tk.Frame(cons, bg=BG)
+    head.pack(fill="x", padx=32, pady=(28, 12))
+    tk.Label(head, text="Consola", font=(FONT, 22, "bold"), fg=FG, bg=BG).pack(side="left")
+
+    log_text = tk.Text(cons, bg=CARD, fg="#b7bccb", font=("Consolas", 9), relief="flat",
+                       wrap="word", state="disabled", bd=0, padx=12, pady=10,
+                       highlightthickness=1, highlightbackground=LINE)
+
+    def copy_log():
+        root.clipboard_clear()
+        root.clipboard_append(log_text.get("1.0", "end"))
+        status_var.set("Consola copiada al portapapeles")
+
+    def clear_log():
+        log_text.config(state="normal")
+        log_text.delete("1.0", "end")
+        log_text.config(state="disabled")
+
+    for label, fn in (("Limpiar", clear_log), ("Copiar todo", copy_log)):
+        tk.Button(head, text=label, font=(FONT, 9), bg=CARD, fg=FG, activebackground=CARD2,
+                  activeforeground=FG, relief="flat", bd=0, cursor="hand2",
+                  command=fn).pack(side="right", padx=(8, 0), ipadx=12, ipady=5)
+
+    sb = tk.Scrollbar(cons, command=log_text.yview)
+    log_text.configure(yscrollcommand=sb.set)
+    sb.pack(side="right", fill="y", padx=(0, 32), pady=(0, 28))
+    log_text.pack(side="left", fill="both", expand=True, padx=(32, 0), pady=(0, 28))
+
     def append_log(text):
         log_text.config(state="normal")
         log_text.insert("end", text.rstrip("\n") + "\n")
         log_text.see("end")
         log_text.config(state="disabled")
 
-    # --- versiones
+    # ------------------------------------------------------------------ navegación
+    def show_page(name):
+        for f in pages.values():
+            f.pack_forget()
+        state["page"] = name
+        pages[name].pack(fill="both", expand=True)
+        for n in nav:
+            style_nav(n)
+
+    # ------------------------------------------------------------------ versiones
     def refresh_versions():
         m = state["manifest"]
         if not m:
@@ -746,13 +936,14 @@ def run_gui():
             msgs.put(("manifest",))
         except Exception as e:
             msgs.put(("log", f"No se pudo cargar la lista de versiones: {e}"))
-            msgs.put(("status", "Sin conexión"))
+            msgs.put(("status", "Sin conexión con Mojang"))
 
-    # --- jugar
-    def set_busy(b):
-        state["busy"] = b
-        play_btn.config(state="disabled" if b else "normal", bg="#2a2f3d" if b else GREEN,
-                        text="TRABAJANDO..." if b else "JUGAR")
+    # ------------------------------------------------------------------ jugar
+    def save_all():
+        cfg.update(username=user_var.get().strip() or "Player", version=ver_var.get(),
+                   ram_mb=int(ram_var.get()), snapshots=snap_var.get(), old=old_var.get(),
+                   minimize=min_var.get())
+        save_config(cfg)
 
     def worker(version, username, ram):
         launcher = Launcher(
@@ -761,16 +952,15 @@ def run_gui():
         )
         try:
             proc = launcher.launch(version, username, ram, state["manifest"])
-            msgs.put(("status", f"Minecraft {version} en ejecución"))
-            msgs.put(("progress", 0, 1, ""))
+            msgs.put(("started", version))
             for line in proc.stdout:
                 msgs.put(("log", line))
             code = proc.wait()
             msgs.put(("log", f"El juego se cerró (código {code})."))
-            msgs.put(("status", "Listo"))
+            msgs.put(("status", "Listo" if code == 0 else f"El juego terminó con código {code}"))
         except Exception as e:
             msgs.put(("log", f"ERROR: {e}"))
-            msgs.put(("status", "Error — revisa la consola"))
+            msgs.put(("error", str(e)))
         finally:
             msgs.put(("idle",))
 
@@ -779,45 +969,68 @@ def run_gui():
             return
         name = user_var.get().strip()
         if not re.fullmatch(r"[A-Za-z0-9_]{3,16}", name):
-            messagebox.showwarning(APP_NAME, "El usuario debe tener 3 a 16 caracteres "
+            messagebox.showwarning(APP_NAME, "El usuario debe tener entre 3 y 16 caracteres "
                                              "(letras, números o guion bajo).")
+            show_page("settings")
             return
         version = ver_var.get()
         if not version:
-            messagebox.showwarning(APP_NAME, "Elige una versión.")
+            messagebox.showwarning(APP_NAME, "Elegí una versión.")
             return
-        cfg.update(username=name, version=version, ram_mb=int(ram_var.get()),
-                   snapshots=snap_var.get(), old=old_var.get())
-        save_config(cfg)
-        set_busy(True)
+        save_all()
+        state["busy"] = True
+        play_btn.set_state("PREPARANDO...", False)
         status_var.set("Preparando...")
-        threading.Thread(target=worker, args=(version, name, int(ram_var.get())), daemon=True).start()
-
-    play_btn.config(command=on_play)
+        threading.Thread(target=worker, args=(version, name, int(ram_var.get())),
+                         daemon=True).start()
 
     def pump():
         try:
             while True:
                 m = msgs.get_nowait()
-                if m[0] == "log":
+                kind = m[0]
+                if kind == "log":
                     append_log(m[1])
-                elif m[0] == "status":
+                elif kind == "status":
                     status_var.set(m[1])
-                elif m[0] == "progress":
+                elif kind == "progress":
                     _, d, t, label = m
                     bar["maximum"] = max(t, 1)
                     bar["value"] = d
                     if label:
-                        status_var.set(f"{label}: {d}/{t}")
-                elif m[0] == "manifest":
+                        status_var.set(f"Descargando {label.lower()}:  {d} / {t}")
+                elif kind == "manifest":
                     refresh_versions()
-                    status_var.set("Listo")
-                elif m[0] == "idle":
-                    set_busy(False)
+                    draw_hero()
+                    status_var.set("Listo para jugar")
+                elif kind == "started":
+                    bar["value"] = 0
+                    play_btn.set_state("JUGANDO", False)
+                    status_var.set(f"Minecraft {m[1]} en ejecución")
+                    if min_var.get():
+                        root.iconify()
+                elif kind == "error":
+                    status_var.set("Error: revisá la consola")
+                    show_page("console")
+                elif kind == "idle":
+                    state["busy"] = False
+                    bar["value"] = 0
+                    play_btn.set_state("JUGAR", True)
+                    if min_var.get():
+                        root.deiconify()
         except queue.Empty:
             pass
         root.after(100, pump)
 
+    def on_close():
+        save_all()
+        if state["busy"] and not messagebox.askokcancel(
+                APP_NAME, "Hay una descarga o el juego está en marcha. ¿Cerrar igual?"):
+            return
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    show_page("play")
     pump()
     threading.Thread(target=load_versions, daemon=True).start()
     append_log(f"Datos guardados en: {ROOT}")
