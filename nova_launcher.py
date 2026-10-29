@@ -1,14 +1,3 @@
-            code = proc.wait()
-            msgs.put(("log", f"El juego se cerró (código {code})."))
-            msgs.put(("status", "Listo" if code == 0 else f"El juego terminó con código {code}"))
-        except Exception as e:
-            msgs.put(("log", f"ERROR: {e}"))
-            msgs.put(("error", str(e)))
-        finally:
-            msgs.put(("idle",))
-
-    def on_play():
-        if state["busy"]:
             return
         name = user_var.get().strip()
         if not re.fullmatch(r"[A-Za-z0-9_]{3,16}", name):
@@ -92,7 +81,8 @@
                 elif kind == "mod_install_done":
                     mod_state["busy"] = False
                     mod_search_btn.config(state="normal")
-                    on_mod_select()
+                    sel = mod_results.curselection()
+                    mod_install_btn.config(state="normal" if sel else "disabled")
         except queue.Empty:
             pass
         root.after(100, pump)
