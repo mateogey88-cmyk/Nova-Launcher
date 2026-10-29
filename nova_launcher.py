@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-NovaLauncher 0.4 - launcher de Minecraft Java Edition en un solo archivo.
+NovaLauncher 0.5 - launcher de Minecraft Java Edition en un solo archivo.
+
+Novedades de la 0.5:
+  * Interfaz nueva: pantalla de inicio con paisaje, barra lateral de iconos y barra de juego
+  * Tienda de mods, texturas y shaders (Modrinth) con cuadrícula; instancia Vanilla -> Fabric en 1 clic
 
 Novedades de la 0.4:
   * Buscador e instalador de mods (Modrinth), con dependencias automáticas
@@ -33,6 +37,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -40,8 +45,8 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 APP_NAME = "NovaLauncher"
-APP_VERSION = "0.4"
-UA = f"{APP_NAME}/{APP_VERSION}"
+APP_VERSION = "0.5"
+UA = f"NovaLauncher/{APP_VERSION} (launcher de Minecraft para amigos)"
 
 MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
 RUNTIME_ALL_URL = (
@@ -145,9 +150,14 @@ def rules_allow(rules):
 # Red y descargas
 # --------------------------------------------------------------------------
 def fetch_json(url, timeout=30):
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"El servidor respondió {e.code} ({url.split('?')[0]})") from None
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"No hay conexión ({e.reason})") from None
 
 
 def sha1_of(path):
@@ -512,6 +522,7 @@ def find_loader_dir(kind, lv):
 # Mods (Modrinth)
 # --------------------------------------------------------------------------
 MODRINTH = "https://api.modrinth.com/v2"
+MOD_DIRS = {"mod": "mods", "resourcepack": "resourcepacks", "shader": "shaderpacks"}
 
 
 def loader_tags(kind):
@@ -519,31 +530,33 @@ def loader_tags(kind):
             "forge": ["forge"], "neoforge": ["neoforge"]}.get(kind, [])
 
 
-def modrinth_search(query, mc, kind, limit=20):
-    facets = [["project_type:mod"], [f"versions:{mc}"],
-              [f"categories:{t}" for t in loader_tags(kind)]]
+def modrinth_search(query, mc, kind, ptype="mod", limit=20):
+    facets = [[f"project_type:{ptype}"], [f"versions:{mc}"]]
+    if ptype == "mod":
+        facets.append([f"categories:{t}" for t in loader_tags(kind)])
     url = (f"{MODRINTH}/search?query={urllib.parse.quote(query)}&limit={limit}"
            f"&index={'relevance' if query else 'downloads'}"
            f"&facets={urllib.parse.quote(json.dumps(facets))}")
     return fetch_json(url).get("hits", [])
 
 
-def modrinth_pick_version(project, mc, kind):
+def modrinth_pick_version(project, mc, kind, ptype="mod"):
     url = (f"{MODRINTH}/project/{urllib.parse.quote(project)}/version"
-           f"?loaders={urllib.parse.quote(json.dumps(loader_tags(kind)))}"
-           f"&game_versions={urllib.parse.quote(json.dumps([mc]))}")
+           f"?game_versions={urllib.parse.quote(json.dumps([mc]))}")
+    if ptype == "mod":
+        url += f"&loaders={urllib.parse.quote(json.dumps(loader_tags(kind)))}"
     vs = fetch_json(url)
     pref = [v for v in vs if v.get("version_type") == "release"] or vs
     return pref[0] if pref else None
 
 
-def modrinth_install(project, mc, kind, mods_dir, _seen=None, depth=0):
-    """Instala un mod y sus dependencias obligatorias. Devuelve los archivos instalados."""
+def modrinth_install(project, mc, kind, dest_dir, _seen=None, depth=0, ptype="mod"):
+    """Instala un proyecto y sus dependencias obligatorias. Devuelve los archivos instalados."""
     seen = _seen if _seen is not None else set()
     if project in seen or depth > 3:
         return []
     seen.add(project)
-    v = modrinth_pick_version(project, mc, kind)
+    v = modrinth_pick_version(project, mc, kind, ptype)
     if not v:
         return []
     files = v.get("files", [])
@@ -551,12 +564,12 @@ def modrinth_install(project, mc, kind, mods_dir, _seen=None, depth=0):
     if not f:
         return []
     name = os.path.basename(f["filename"])
-    os.makedirs(mods_dir, exist_ok=True)
-    download(f["url"], os.path.join(mods_dir, name), (f.get("hashes") or {}).get("sha1"))
+    os.makedirs(dest_dir, exist_ok=True)
+    download(f["url"], os.path.join(dest_dir, name), (f.get("hashes") or {}).get("sha1"))
     installed = [name]
     for dep in v.get("dependencies", []):
         if dep.get("dependency_type") == "required" and dep.get("project_id"):
-            installed += modrinth_install(dep["project_id"], mc, kind, mods_dir, seen, depth + 1)
+            installed += modrinth_install(dep["project_id"], mc, kind, dest_dir, seen, depth + 1, ptype)
     return installed
 
 
@@ -953,6 +966,7 @@ def set_dpi_awareness():
 
 def run_gui():
     import copy
+    import math
     import random
     set_dpi_awareness()
     import tkinter as tk
@@ -1110,46 +1124,51 @@ def run_gui():
             fn(inst)
 
     # ================================================================== sidebar
-    sidebar = tk.Frame(root, bg=SIDE, width=px(230))
+    DARK = "#0a0c11"
+    sidebar = tk.Frame(root, bg=SIDE, width=px(96))
     sidebar.pack(side="left", fill="y")
     sidebar.pack_propagate(False)
-    logo = tk.Frame(sidebar, bg=SIDE)
-    logo.pack(fill="x", padx=px(22), pady=(px(28), px(24)))
-    tk.Label(logo, text="NOVA", font=(FONT, 24, "bold"), fg=ACCENT, bg=SIDE).pack(anchor="w")
-    tk.Label(logo, text="LAUNCHER", font=(FONT, 9, "bold"), fg=MUTED, bg=SIDE).pack(anchor="w")
+    tk.Label(sidebar, text="N", font=(FONT, 20, "bold"), fg="white", bg=ACCENT).pack(
+        pady=(px(24), px(26)), ipadx=px(15), ipady=px(4))
 
     nav, pages = {}, {}
 
     def style_nav(name, hover=False):
-        row, bar, lab = nav[name]
+        row, bar, box, g, t = nav[name]
         active = state["page"] == name
         bg = CARD if (active or hover) else SIDE
-        row.configure(bg=bg)
+        fg = ACCENT if active else (FG if hover else MUTED)
+        for w in (row, box):
+            w.configure(bg=bg)
         bar.configure(bg=ACCENT if active else bg)
-        lab.configure(bg=bg, fg=FG if (active or hover) else MUTED)
+        g.configure(bg=bg, fg=fg)
+        t.configure(bg=bg, fg=FG if (active or hover) else MUTED)
 
-    def make_nav(text, name):
+    def make_nav(glyph, text, name):
         row = tk.Frame(sidebar, bg=SIDE, cursor="hand2")
-        row.pack(fill="x", pady=1)
+        row.pack(fill="x", pady=2)
         bar = tk.Frame(row, bg=SIDE, width=px(4))
         bar.pack(side="left", fill="y")
-        lab = tk.Label(row, text=text, font=(FONT, 11), fg=MUTED, bg=SIDE, anchor="w",
-                       padx=px(18), pady=px(13))
-        lab.pack(side="left", fill="x", expand=True)
-        nav[name] = (row, bar, lab)
-        for w in (row, lab, bar):
+        box = tk.Frame(row, bg=SIDE)
+        box.pack(side="left", fill="x", expand=True, pady=px(10))
+        g = tk.Label(box, text=glyph, font=(FONT, 18), fg=MUTED, bg=SIDE)
+        g.pack()
+        t = tk.Label(box, text=text, font=(FONT, 8), fg=MUTED, bg=SIDE)
+        t.pack()
+        nav[name] = (row, bar, box, g, t)
+        for w in (row, bar, box, g, t):
             w.bind("<Button-1>", lambda e, n=name: show_page(n))
             w.bind("<Enter>", lambda e, n=name: style_nav(n, True))
             w.bind("<Leave>", lambda e, n=name: style_nav(n, False))
 
-    make_nav("▶   Jugar", "play")
-    make_nav("▦   Instancias", "instances")
-    make_nav("✦   Mods", "mods")
-    make_nav("⚙   Ajustes", "settings")
-    make_nav("≡   Consola", "console")
+    make_nav("⌂", "Inicio", "play")
+    make_nav("▦", "Instancias", "instances")
+    make_nav("✦", "Tienda", "mods")
+    make_nav("⚙", "Ajustes", "settings")
+    make_nav("≡", "Consola", "console")
 
     side_bottom = tk.Frame(sidebar, bg=SIDE)
-    side_bottom.pack(side="bottom", fill="x", padx=px(18), pady=px(18))
+    side_bottom.pack(side="bottom", fill="x", pady=px(14))
 
     def open_folder(path):
         os.makedirs(path, exist_ok=True)
@@ -1167,10 +1186,10 @@ def run_gui():
         b.bind("<Leave>", lambda e: b.config(bg=bg))
         return b
 
-    flat_btn(side_bottom, "Abrir carpeta de datos", lambda: open_folder(ROOT)).pack(
-        fill="x", ipady=px(7))
-    tk.Label(side_bottom, text=f"v{APP_VERSION}", font=(FONT, 8), fg=MUTED, bg=SIDE).pack(
-        pady=(px(10), 0))
+    fld = tk.Label(side_bottom, text="▣\nDatos", font=(FONT, 9), fg=MUTED, bg=SIDE, cursor="hand2")
+    fld.pack()
+    fld.bind("<Button-1>", lambda e: open_folder(ROOT))
+    tk.Label(side_bottom, text=f"v{APP_VERSION}", font=(FONT, 8), fg=MUTED, bg=SIDE).pack(pady=(px(8), 0))
 
     content = tk.Frame(root, bg=BG)
     content.pack(side="left", fill="both", expand=True)
@@ -1184,76 +1203,120 @@ def run_gui():
     def page_title(parent, text):
         return tk.Label(parent, text=text, font=(FONT, 22, "bold"), fg=FG, bg=BG)
 
-    # ================================================================== JUGAR
+    # ================================================================== INICIO
     play = tk.Frame(content, bg=BG)
     pages["play"] = play
-    hero = tk.Canvas(play, height=px(220), bg=BG, highlightthickness=0)
-    hero.pack(fill="x")
+    scene = tk.Canvas(play, bg=BG, highlightthickness=0, bd=0)
+    scene.place(x=0, y=0, relwidth=1.0, relheight=1.0)
 
-    def draw_hero(_=None):
-        w, h = hero.winfo_width(), hero.winfo_height()
-        if w < 10 or h < 10:
+    def round_rect(cv, x1, y1, x2, y2, r, **kw):
+        pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+               x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+        return cv.create_polygon(pts, smooth=True, **kw)
+
+    def heights(w, seed, base, amp, step):
+        r = random.Random(seed)
+        p1, p2, p3 = r.random() * 6, r.random() * 6, r.random() * 6
+        out = []
+        for i in range(w // step + 2):
+            v = 0.55 * math.sin(i * 0.17 + p1) + 0.3 * math.sin(i * 0.41 + p2) + 0.15 * math.sin(i * 0.93 + p3)
+            out.append(int((base + amp * v) // step * step))
+        return out
+
+    def draw_scene(_=None):
+        w, h = scene.winfo_width(), scene.winfo_height()
+        if w < 60 or h < 60:
             return
-        hero.delete("all")
-        top, bottom = "#274291", BG
-        for y in range(0, h, 2):
-            hero.create_line(0, y, w, y, fill=blend(top, bottom, y / h), width=2)
-        rng = random.Random(7)
-        size = px(30)
-        cols, rows = w // size + 1, h // size + 1
-        for cx in range(cols):
-            for cy in range(rows):
-                if rng.random() < (cx / cols) * 0.6:
-                    base = blend(top, bottom, min(1.0, (cy * size) / h))
-                    shade = blend(base, "#8fb0ff", 0.08 + 0.16 * rng.random())
-                    hero.create_rectangle(cx * size, cy * size, cx * size + size - 3,
-                                          cy * size + size - 3, fill=shade, outline="")
+        scene.delete("all")
+        sky_top, sky_low = "#141d45", "#f09a68"
+        for y in range(0, h, 3):
+            scene.create_line(0, y, w, y, fill=blend(sky_top, sky_low, min(1.0, y / h * 1.3)), width=3)
+        rng = random.Random(11)
+        for _i in range(70):
+            x, y, z = rng.randrange(w), rng.randrange(int(h * 0.4)), px(rng.choice([1, 2]))
+            scene.create_rectangle(x, y, x + z, y + z, fill=blend(sky_top, "#ffffff", 0.3 + rng.random() * 0.6),
+                                   outline="")
+        sx, sy, r0 = int(w * 0.74), int(h * 0.36), px(50)
+        for k, (grow, col) in enumerate(((1.9, "#6b4a63"), (1.5, "#b8707a"), (1.2, "#e79a6c"), (1.0, "#ffd27a"))):
+            rr = int(r0 * grow)
+            scene.create_rectangle(sx - rr, sy - rr, sx + rr, sy + rr, fill=col, outline="")
+        for cxr, cyr, n in ((0.18, 0.30, 5), (0.52, 0.22, 4), (0.88, 0.14, 6), (0.35, 0.44, 3)):
+            bw, bh = px(30), px(16)
+            for i in range(n):
+                x0 = int(w * cxr) + i * bw
+                y0 = int(h * cyr) - (i % 2) * bh
+                scene.create_rectangle(x0, y0, x0 + bw, y0 + bh, fill=blend(sky_top, "#ffffff", 0.35), outline="")
+        step = px(24)
+        for seed, base, amp, col in ((3, 0.60, 0.09, "#343a78"), (7, 0.68, 0.07, "#25506b")):
+            for i, hy in enumerate(heights(w, seed, h * base, h * amp, step)):
+                scene.create_rectangle(i * step, hy, i * step + step, h, fill=col, outline="")
+        near = heights(w, 13, h * 0.76, h * 0.045, step)
+        rr2 = random.Random(5)
+        for i, hy in enumerate(near):
+            x0 = i * step
+            scene.create_rectangle(x0, hy, x0 + step, hy + step // 2,
+                                   fill=blend("#4fb552", "#7be07e", rr2.random() * 0.5), outline="")
+            scene.create_rectangle(x0, hy + step // 2, x0 + step, hy + step,
+                                   fill=blend("#3f8f45", "#4a9a4a", rr2.random()), outline="")
+            scene.create_rectangle(x0, hy + step, x0 + step, h,
+                                   fill=blend("#6d4b31", "#7a5638", rr2.random()), outline="")
+            if i % 9 == 4:
+                scene.create_rectangle(x0 + step * 0.35, hy - step * 2, x0 + step * 0.65, hy, fill="#5a3d26", outline="")
+                scene.create_rectangle(x0 - step, hy - step * 4, x0 + step * 2, hy - step * 2, fill="#2f7a3d", outline="")
+                scene.create_rectangle(x0, hy - step * 5, x0 + step, hy - step * 4, fill="#3a8f49", outline="")
+        # textos
         name = user_var.get().strip() or "Jugador"
         inst = cur()
         sub = describe(inst) if inst else "Creá una instancia para empezar"
-        hero.create_text(px(44), h / 2 - px(22), anchor="w", text=f"Hola, {name}", fill="white",
-                         font=(FONT, 30, "bold"))
-        hero.create_text(px(46), h / 2 + px(26), anchor="w", text=sub, fill="#c5d3ff",
-                         font=(FONT, 12))
+        scene.create_text(px(52) + 2, int(h * 0.20) + 2, anchor="w", text=f"Hola, {name}", fill="#0b0d18",
+                          font=(FONT, 36, "bold"))
+        scene.create_text(px(52), int(h * 0.20), anchor="w", text=f"Hola, {name}", fill="white",
+                          font=(FONT, 36, "bold"))
+        scene.create_text(px(54), int(h * 0.20) + px(46), anchor="w", text=sub, fill="#ffe1c9",
+                          font=(FONT, 13))
+        x, y = px(54), int(h * 0.20) + px(78)
+        for txt in (ram_text.get(), loader_text.get(), time_text.get()):
+            wp = len(txt) * px(8) + px(34)
+            round_rect(scene, x, y, x + wp, y + px(32), px(16), fill=DARK, outline="")
+            scene.create_text(x + wp / 2, y + px(16), text=txt, fill=FG, font=(FONT, 10, "bold"))
+            x += wp + px(10)
+        # chip de usuario
+        cx2, cy2 = w - px(24), px(22)
+        cw = px(190)
+        round_rect(scene, cx2 - cw, cy2, cx2, cy2 + px(46), px(14), fill=DARK, outline="")
+        scene.create_rectangle(cx2 - cw + px(8), cy2 + px(8), cx2 - cw + px(38), cy2 + px(38),
+                               fill=accent_for(name), outline="")
+        scene.create_text(cx2 - cw + px(23), cy2 + px(23), text=name[:1].upper(), fill="white",
+                          font=(FONT, 13, "bold"))
+        scene.create_text(cx2 - cw + px(48), cy2 + px(23), anchor="w", text=name[:14], fill=FG,
+                          font=(FONT, 11, "bold"))
 
-    hero.bind("<Configure>", draw_hero)
-    user_var.trace_add("write", lambda *a: draw_hero())
+    draw_hero = draw_scene
+    scene.bind("<Configure>", draw_scene)
+    scene.bind("<Button-1>", lambda e: show_page("settings")
+               if (e.x > scene.winfo_width() - px(220) and e.y < px(70)) else None)
+    user_var.trace_add("write", lambda *a: draw_scene())
 
-    body = tk.Frame(play, bg=BG)
-    body.pack(fill="both", expand=True, padx=px(36), pady=(px(22), px(10)))
-
-    vcard = card(body)
-    vcard.pack(fill="x")
-    small_title(vcard, "INSTANCIA").pack(anchor="w", padx=px(20), pady=(px(14), px(6)))
-    row = tk.Frame(vcard, bg=CARD)
-    row.pack(fill="x", padx=px(20), pady=(0, px(16)))
-    inst_box = ttk.Combobox(row, textvariable=sel_var, state="readonly", font=(FONT, 12))
-    inst_box.pack(side="left", fill="x", expand=True, ipady=px(4))
-    flat_btn(row, "Gestionar", lambda: show_page("instances")).pack(
-        side="left", padx=(px(10), 0), ipadx=px(12), ipady=px(6))
-
-    stats = tk.Frame(body, bg=BG)
-    stats.pack(fill="x", pady=px(14))
-    for i in range(4):
-        stats.columnconfigure(i, weight=1, uniform="s")
-
-    def stat_card(col, title, var):
-        f = card(stats)
-        f.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else px(8), 0 if col == 3 else px(8)))
-        small_title(f, title).pack(anchor="w", padx=px(16), pady=(px(12), 0))
-        tk.Label(f, textvariable=var, font=(FONT, 14, "bold"), fg=FG, bg=CARD).pack(
-            anchor="w", padx=px(16), pady=(px(2), px(12)))
-
-    stat_card(0, "MEMORIA RAM", ram_text)
-    stat_card(1, "CARGADOR", loader_text)
-    stat_card(2, "USUARIO", user_var)
-    stat_card(3, "TIEMPO JUGADO", time_text)
-
-    play_btn = RoundButton(body, "JUGAR", lambda: on_play(), GREEN, GREEN_H, BG)
-    play_btn.pack(fill="x", pady=(px(4), px(12)))
-    tk.Label(body, textvariable=status_var, font=(FONT, 9), fg=MUTED, bg=BG, anchor="w").pack(fill="x")
-    bar = ttk.Progressbar(body, mode="determinate", style="Nova.Horizontal.TProgressbar")
-    bar.pack(fill="x", pady=(px(6), 0))
+    bottom = tk.Frame(play, bg=DARK)
+    bottom.place(x=0, rely=1.0, relwidth=1.0, anchor="sw", height=px(104))
+    bl = tk.Frame(bottom, bg=DARK)
+    bl.pack(side="left", padx=(px(34), px(10)), pady=px(14))
+    small_title(bl, "INSTANCIA", bg=DARK).pack(anchor="w")
+    row = tk.Frame(bl, bg=DARK)
+    row.pack(anchor="w", pady=(px(5), 0))
+    inst_box = ttk.Combobox(row, textvariable=sel_var, state="readonly", font=(FONT, 12), width=24)
+    inst_box.pack(side="left", ipady=px(4))
+    flat_btn(row, "Gestionar", lambda: show_page("instances"), bg=CARD, hover=CARD2).pack(
+        side="left", padx=(px(8), 0), ipadx=px(12), ipady=px(6))
+    play_btn = RoundButton(bottom, "JUGAR", lambda: on_play(), GREEN, GREEN_H, DARK, height=62)
+    play_btn.configure(width=px(270))
+    play_btn.pack(side="right", padx=px(34), pady=px(20))
+    mid = tk.Frame(bottom, bg=DARK)
+    mid.pack(side="left", fill="x", expand=True, padx=px(16))
+    tk.Label(mid, textvariable=status_var, font=(FONT, 9), fg=MUTED, bg=DARK, anchor="w").pack(
+        fill="x", pady=(px(20), 0))
+    bar = ttk.Progressbar(mid, mode="determinate", style="Nova.Horizontal.TProgressbar")
+    bar.pack(fill="x", pady=(px(8), 0))
 
     # ================================================================== INSTANCIAS
     inst_page = tk.Frame(content, bg=BG)
@@ -1338,71 +1401,159 @@ def run_gui():
         save_all()
         refresh_all()
 
-    # ================================================================== MODS
+    # ================================================================== TIENDA
     mods_page = tk.Frame(content, bg=BG)
     pages["mods"] = mods_page
-    page_title(mods_page, "Mods").pack(anchor="w", padx=px(36), pady=(px(28), px(2)))
+    mt = tk.Frame(mods_page, bg=BG)
+    mt.pack(fill="x", padx=px(36), pady=(px(26), px(4)))
+    page_title(mt, "Tienda").pack(side="left")
     mods_target = tk.StringVar(value="")
-    tk.Label(mods_page, textvariable=mods_target, font=(FONT, 10), fg=MUTED, bg=BG,
-             anchor="w").pack(fill="x", padx=px(38))
+    tk.Label(mt, textvariable=mods_target, font=(FONT, 10), fg=MUTED, bg=BG).pack(
+        side="left", padx=px(16), pady=(px(12), 0))
+    mods_state = {"tok": 0, "for": None, "ptype": "mod"}
+
+    tabs = tk.Frame(mods_page, bg=BG)
+    tabs.pack(fill="x", padx=px(36), pady=(px(6), px(8)))
+    tab_btns = {}
+
+    def style_tabs():
+        for k, b in tab_btns.items():
+            on = k == mods_state["ptype"]
+            b.config(bg=ACCENT if on else CARD, fg="white" if on else FG)
+
+    def set_ptype(k):
+        mods_state["ptype"] = k
+        style_tabs()
+        mods_search()
+
+    for k, label in (("mod", "Mods"), ("resourcepack", "Texturas"), ("shader", "Shaders")):
+        b = tk.Button(tabs, text=label, font=(FONT, 10, "bold"), bg=CARD, fg=FG, activebackground=CARD2,
+                      activeforeground=FG, relief="flat", bd=0, cursor="hand2",
+                      command=lambda kk=k: set_ptype(kk))
+        b.pack(side="left", padx=(0, px(6)), ipadx=px(20), ipady=px(7))
+        tab_btns[k] = b
+    flat_btn(tabs, "Instalados", lambda: mods_installed(), size=10).pack(
+        side="right", ipadx=px(16), ipady=px(7))
+
     mrow = tk.Frame(mods_page, bg=BG)
-    mrow.pack(fill="x", padx=px(36), pady=(px(14), px(8)))
+    mrow.pack(fill="x", padx=px(36), pady=(0, px(6)))
     mods_q = tk.StringVar()
     mq = tk.Entry(mrow, textvariable=mods_q, font=(FONT, 12), bg=CARD2, fg=FG, insertbackground=FG,
                   relief="flat", highlightthickness=1, highlightbackground=LINE, highlightcolor=ACCENT)
     mq.pack(side="left", fill="x", expand=True, ipady=px(7))
     mq.bind("<Return>", lambda e: mods_search())
-    flat_btn(mrow, "Buscar", lambda: mods_search(), bg=ACCENT, hover="#7ba3ff", fg="white",
-             size=10).pack(side="left", padx=(px(8), 0), ipadx=px(18), ipady=px(7))
-    flat_btn(mrow, "Instalados", lambda: mods_installed(), size=10).pack(
-        side="left", padx=(px(8), 0), ipadx=px(14), ipady=px(7))
+    flat_btn(mrow, "Buscar", lambda: mods_search(), bg=ACCENT, hover="#7ba3ff", fg="white", size=10).pack(
+        side="left", padx=(px(8), 0), ipadx=px(20), ipady=px(7))
     mods_status = tk.StringVar(value="")
-    tk.Label(mods_page, textvariable=mods_status, font=(FONT, 9), fg=MUTED, bg=BG,
-             anchor="w").pack(fill="x", padx=px(38), pady=(0, px(6)))
+    mods_status_lbl = tk.Label(mods_page, textvariable=mods_status, font=(FONT, 10), fg=MUTED, bg=BG,
+                               anchor="w", justify="left", wraplength=px(820))
+    mods_status_lbl.pack(fill="x", padx=px(38), pady=(0, px(6)))
     mods_list = ScrollFrame(mods_page, BG)
     mods_list.pack(fill="both", expand=True, padx=(px(36), px(20)), pady=(0, px(20)))
-    mods_state = {"tok": 0, "for": None}
+    mods_list.inner.columnconfigure(0, weight=1, uniform="g")
+    mods_list.inner.columnconfigure(1, weight=1, uniform="g")
 
-    def mods_context():
-        inst = cur()
-        if not inst:
-            mods_status.set("Creá una instancia primero.")
-            return None
-        if inst["loader"] == "vanilla":
-            mods_status.set("Esta instancia es Vanilla. Creá una con Fabric, Quilt, Forge o "
-                            "NeoForge para usar mods.")
-            return None
-        return inst
+    def set_mstat(text, err=False):
+        mods_status.set(text)
+        mods_status_lbl.config(fg="#ff8a9b" if err else MUTED)
 
     def clear_mods_list():
         for w in mods_list.inner.winfo_children():
             w.destroy()
 
+    def ptype_dir(inst):
+        return os.path.join(game_dir(inst), MOD_DIRS[mods_state["ptype"]])
+
+    def mods_context():
+        inst = cur()
+        if not inst:
+            set_mstat("Creá una instancia primero.", True)
+        return inst
+
     def mods_enter():
         inst = cur()
         mods_target.set(f"Instancia: {inst['name']}  ·  {describe(inst)}" if inst else "")
+        style_tabs()
         if inst and mods_state["for"] != inst["id"]:
             mods_state["for"] = inst["id"]
-            clear_mods_list()
             mods_search()
 
     def open_mods_for(iid):
         cfg["last_instance"] = iid
+        mods_state["for"] = None
         refresh_all()
         show_page("mods")
+
+    def quick_create(kind):
+        inst = cur()
+        if not inst:
+            return
+        mc = inst["mc"]
+        set_mstat(f"Buscando {LOADER_NAMES[kind]} para Minecraft {mc}...")
+
+        def job():
+            try:
+                vs = loader_versions(kind, mc)
+            except Exception as e:
+                vs = e
+            msgs.put(("quick", kind, mc, vs))
+        threading.Thread(target=job, daemon=True).start()
+
+    def finish_quick(kind, mc, vs):
+        if isinstance(vs, Exception):
+            set_mstat(f"No se pudo consultar {LOADER_NAMES[kind]}: {vs}", True)
+            return
+        if not vs:
+            set_mstat(f"{LOADER_NAMES[kind]} no está disponible para Minecraft {mc}.", True)
+            return
+        base = cur()
+        ni = new_instance(unique_name(f"{LOADER_NAMES[kind]} {mc}", instances()), mc, kind, vs[0],
+                          ram_mb=(base or {}).get("ram_mb", 4096))
+        instances().append(ni)
+        cfg["last_instance"] = ni["id"]
+        save_all()
+        refresh_all()
+        mods_state["for"] = None
+        mods_enter()
+
+    def show_vanilla_cta(inst):
+        clear_mods_list()
+        set_mstat("")
+        c = card(mods_list.inner)
+        c.grid(row=0, column=0, columnspan=2, sticky="ew", padx=(0, px(8)), pady=px(6))
+        tk.Label(c, text="Esta instancia es Vanilla y no acepta mods", font=(FONT, 14, "bold"), fg=FG,
+                 bg=CARD).pack(anchor="w", padx=px(22), pady=(px(18), px(4)))
+        tk.Label(c, text=f"Los mods necesitan un cargador. Creá en un clic una instancia de Minecraft "
+                         f"{inst['mc']} con el que prefieras (te recomiendo Fabric):",
+                 font=(FONT, 10), fg=MUTED, bg=CARD, wraplength=px(700), justify="left").pack(
+            anchor="w", padx=px(22))
+        r = tk.Frame(c, bg=CARD)
+        r.pack(anchor="w", padx=px(22), pady=px(18))
+        for k in ("fabric", "quilt", "forge", "neoforge"):
+            main = k == "fabric"
+            flat_btn(r, LOADER_NAMES[k], lambda kk=k: quick_create(kk), bg=ACCENT if main else CARD2,
+                     hover="#7ba3ff" if main else LINE, fg="white" if main else FG, size=10).pack(
+                side="left", padx=(0, px(8)), ipadx=px(18), ipady=px(8))
+        tk.Label(c, text="Las pestañas Texturas y Shaders sí funcionan en esta instancia.",
+                 font=(FONT, 9), fg=MUTED, bg=CARD).pack(anchor="w", padx=px(22), pady=(0, px(16)))
 
     def mods_search():
         inst = mods_context()
         if not inst:
             return
+        ptype = mods_state["ptype"]
+        if ptype == "mod" and inst["loader"] == "vanilla":
+            mods_state["tok"] += 1
+            show_vanilla_cta(inst)
+            return
         mods_state["tok"] += 1
         tok = mods_state["tok"]
-        mods_status.set("Buscando en Modrinth...")
+        set_mstat("Buscando en Modrinth...")
         q, mc, kind = mods_q.get().strip(), inst["mc"], inst["loader"]
 
         def job():
             try:
-                res = modrinth_search(q, mc, kind)
+                res = modrinth_search(q, mc, kind, ptype)
             except Exception as e:
                 res = e
             msgs.put(("mods", tok, res))
@@ -1413,40 +1564,43 @@ def run_gui():
             return
         clear_mods_list()
         if isinstance(hits, Exception):
-            mods_status.set(f"No se pudo buscar: {hits}")
+            set_mstat(f"No se pudo cargar la tienda: {hits}. Revisá tu internet y tocá Buscar para reintentar.",
+                      True)
+            append_log(f"[Tienda] Error: {hits}")
             return
         if not hits:
-            mods_status.set("Sin resultados para esta versión y cargador.")
+            set_mstat("Sin resultados para esta versión de Minecraft. Probá con otra búsqueda.")
             return
-        mods_status.set(f"{len(hits)} resultados (Modrinth) — los más descargados primero"
-                        if not mods_q.get().strip() else f"{len(hits)} resultados (Modrinth)")
-        for h in hits:
+        set_mstat(f"{len(hits)} resultados" + ("" if mods_q.get().strip() else " · los más descargados"))
+        for idx, h in enumerate(hits):
             c = card(mods_list.inner)
-            c.pack(fill="x", pady=(0, px(8)), padx=(0, px(8)))
-            left = tk.Frame(c, bg=CARD)
-            left.pack(side="left", fill="x", expand=True, padx=px(16), pady=px(12))
-            tk.Label(left, text=h.get("title", "?"), font=(FONT, 12, "bold"), fg=FG, bg=CARD,
-                     anchor="w").pack(fill="x")
-            tk.Label(left, text=(h.get("description") or "")[:130], font=(FONT, 9), fg=MUTED, bg=CARD,
-                     anchor="w", justify="left", wraplength=px(560)).pack(fill="x")
+            c.grid(row=idx // 2, column=idx % 2, sticky="nsew", padx=(0, px(8)), pady=(0, px(8)))
+            title = h.get("title") or "?"
+            tk.Label(c, text=title[:1].upper(), font=(FONT, 20, "bold"), fg="white",
+                     bg=accent_for(h.get("project_id", title)), width=3).pack(side="left", fill="y")
+            mid2 = tk.Frame(c, bg=CARD)
+            mid2.pack(side="left", fill="both", expand=True, padx=px(14), pady=px(12))
+            tk.Label(mid2, text=title, font=(FONT, 12, "bold"), fg=FG, bg=CARD, anchor="w").pack(fill="x")
+            tk.Label(mid2, text=(h.get("description") or "")[:110], font=(FONT, 9), fg=MUTED, bg=CARD,
+                     anchor="w", justify="left", wraplength=px(300)).pack(fill="x")
             dl = f"{int(h.get('downloads', 0)):,}".replace(",", ".")
-            tk.Label(left, text=f"{dl} descargas", font=(FONT, 8), fg=MUTED, bg=CARD,
-                     anchor="w").pack(fill="x", pady=(px(2), 0))
-            flat_btn(c, "Instalar", lambda p=h["project_id"], t=h.get("title", "mod"): mods_install(p, t),
+            tk.Label(mid2, text=f"{dl} descargas", font=(FONT, 8), fg=MUTED, bg=CARD, anchor="w").pack(
+                fill="x", pady=(px(3), 0))
+            flat_btn(c, "Instalar", lambda p=h.get("project_id"), t=title: mods_install(p, t),
                      bg=GREEN, hover=GREEN_H, fg="white", size=10).pack(
-                side="right", padx=px(14), ipadx=px(16), ipady=px(7))
+                side="right", padx=px(12), ipadx=px(14), ipady=px(7))
 
     def mods_install(project, title):
         inst = mods_context()
-        if not inst:
+        if not inst or not project:
             return
-        mods_dir = os.path.join(game_dir(inst), "mods")
-        mc, kind = inst["mc"], inst["loader"]
-        mods_status.set(f"Instalando {title}...")
+        ptype = mods_state["ptype"]
+        dest, mc, kind = ptype_dir(inst), inst["mc"], inst["loader"]
+        set_mstat(f"Instalando {title}...")
 
         def job():
             try:
-                res = modrinth_install(project, mc, kind, mods_dir)
+                res = modrinth_install(project, mc, kind, dest, ptype=ptype)
             except Exception as e:
                 res = e
             msgs.put(("modinst", title, res))
@@ -1457,16 +1611,16 @@ def run_gui():
         if not inst:
             return
         mods_state["tok"] += 1
-        d = os.path.join(game_dir(inst), "mods")
-        files = sorted(f for f in os.listdir(d) if f.endswith((".jar", ".disabled"))) \
-            if os.path.isdir(d) else []
+        ptype = mods_state["ptype"]
+        d = ptype_dir(inst)
+        exts = {"mod": (".jar", ".disabled"), "resourcepack": (".zip",), "shader": (".zip",)}[ptype]
+        files = sorted(f for f in os.listdir(d) if f.endswith(exts)) if os.path.isdir(d) else []
         clear_mods_list()
-        mods_status.set(f"{len(files)} archivo(s) en la carpeta de mods" if files
-                        else "Todavía no hay mods instalados en esta instancia.")
-        for fn in files:
+        set_mstat(f"{len(files)} archivo(s) instalados" if files else "Todavía no hay nada instalado acá.")
+        for i, fn in enumerate(files):
             off = fn.endswith(".disabled")
             c = card(mods_list.inner)
-            c.pack(fill="x", pady=(0, px(6)), padx=(0, px(8)))
+            c.grid(row=i, column=0, columnspan=2, sticky="ew", padx=(0, px(8)), pady=(0, px(6)))
             tk.Label(c, text=fn.replace(".disabled", "") + ("   (desactivado)" if off else ""),
                      font=(FONT, 10), fg=MUTED if off else FG, bg=CARD, anchor="w").pack(
                 side="left", padx=px(16), pady=px(11), fill="x", expand=True)
@@ -1477,19 +1631,20 @@ def run_gui():
                 try:
                     os.replace(src, dst)
                 except OSError as e:
-                    mods_status.set(f"No se pudo cambiar: {e}")
+                    set_mstat(f"No se pudo cambiar: {e}", True)
                 mods_installed()
 
             def remove(f=fn):
                 try:
                     os.remove(os.path.join(d, f))
                 except OSError as e:
-                    mods_status.set(f"No se pudo quitar: {e}")
+                    set_mstat(f"No se pudo quitar: {e}", True)
                 mods_installed()
             flat_btn(c, "Quitar", remove, bg=CARD2, hover=RED, fg="#ff8a9b").pack(
                 side="right", padx=px(8), ipadx=px(10), ipady=px(5))
-            flat_btn(c, "Activar" if off else "Desactivar", toggle, bg=CARD2, hover=LINE).pack(
-                side="right", padx=px(4), ipadx=px(10), ipady=px(5))
+            if ptype == "mod":
+                flat_btn(c, "Activar" if off else "Desactivar", toggle, bg=CARD2, hover=LINE).pack(
+                    side="right", padx=px(4), ipadx=px(10), ipady=px(5))
 
     # ================================================================== AJUSTES
     sett = tk.Frame(content, bg=BG)
@@ -1910,12 +2065,15 @@ def run_gui():
                     show_hits(m[1], m[2])
                 elif kind == "modinst":
                     if isinstance(m[2], Exception):
-                        mods_status.set(f"Error instalando {m[1]}: {m[2]}")
+                        set_mstat(f"Error instalando {m[1]}: {m[2]}", True)
+                        append_log(f"[Tienda] Error instalando {m[1]}: {m[2]}")
                     elif not m[2]:
-                        mods_status.set(f"{m[1]}: no hay una versión compatible con esta instancia.")
+                        set_mstat(f"{m[1]}: no hay una versión compatible con esta instancia.", True)
                     else:
-                        mods_status.set(f"Instalado: {m[1]} ({len(m[2])} archivo(s), con dependencias)")
-                        append_log("Mods instalados: " + ", ".join(m[2]))
+                        set_mstat(f"Instalado: {m[1]} ({len(m[2])} archivo(s), con dependencias)")
+                        append_log("Instalado: " + ", ".join(m[2]))
+                elif kind == "quick":
+                    finish_quick(m[1], m[2], m[3])
                 elif kind == "started":
                     bar["value"] = 0
                     play_btn.set_state("JUGANDO", False)
