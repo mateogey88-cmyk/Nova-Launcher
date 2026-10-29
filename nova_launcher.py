@@ -1,25 +1,13 @@
 #!/usr/bin/env python3
 """
-NovaLauncher 0.5 - launcher de Minecraft Java Edition en un solo archivo.
+NovaLauncher 0.6 - launcher de Minecraft Java Edition en un solo archivo.
 
-Novedades de la 0.5:
-  * Interfaz nueva: pantalla de inicio con paisaje, barra lateral de iconos y barra de juego
-  * Tienda de mods, texturas y shaders (Modrinth) con cuadrícula; instancia Vanilla -> Fabric en 1 clic
+Novedades de la 0.6:
+  * Interfaz estilo Battly: barra dorada, fondo nocturno, tarjetas de novedades y estado,
+    "Jugador activo" y barra flotante inferior (Inicio, Mods, Consola, Ajustes, Instancias,
+    Descargar, Jugar)
 
-Novedades de la 0.4:
-  * Buscador e instalador de mods (Modrinth), con dependencias automáticas
-  * Duplicar instancias, tiempo jugado, colores por instancia
-  * Detección de cierres con error del juego
-
-Novedades de la 0.3:
-  * Instancias: varias versiones/instalaciones a la vez, cada una con sus mods,
-    mundos, RAM y opciones propias
-  * Mod loaders: Fabric, Quilt, Forge y NeoForge
-  * Más opciones: resolución del juego, pantalla completa, argumentos JVM,
-    perfil de rendimiento, Java personalizado
-  * Interfaz más grande y nítida (soporte de pantallas de alta resolución)
-
-Requisitos: Python 3.8+ (con tkinter, ya viene en el instalador de python.org)
+Requisitos: Python 3.8+ (con tkinter)
 Uso:        python nova_launcher.py
 """
 
@@ -45,7 +33,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 APP_NAME = "NovaLauncher"
-APP_VERSION = "0.5"
+APP_VERSION = "0.6"
 UA = f"NovaLauncher/{APP_VERSION} (launcher de Minecraft para amigos)"
 
 MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
@@ -933,7 +921,7 @@ def describe(inst):
     return f"{loader}  ·  Minecraft {inst['mc']}"
 
 
-PALETTE = ["#5b8cff", "#2fbf71", "#e0a030", "#c0589a", "#38b6c9", "#9b6bff", "#e0603c"]
+PALETTE = ["#3a8ad8", "#2fbf71", "#e0a030", "#c0589a", "#38b6c9", "#9b6bff", "#e0603c"]
 
 
 def accent_for(iid):
@@ -946,6 +934,23 @@ def fmt_time(sec):
         return "Sin jugar" if sec == 0 else "< 1 min"
     h, m = divmod(sec // 60, 60)
     return f"{h} h {m} min" if h else f"{m} min"
+
+
+MESES = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto",
+         "Septiembre", "Octubre", "Noviembre", "Diciembre"]
+
+NEWS = {
+    "Novedades de Nova": (
+        "¡Nueva interfaz en NovaLauncher!",
+        "Pantalla de inicio renovada, barra de acciones flotante y tienda de mods, "
+        "texturas y shaders con Modrinth.",
+        "Nova Staff"),
+    "Consejos": (
+        "Mods en un solo clic",
+        "Si tu instancia es Vanilla, entrá a Mods y creá una de Fabric automáticamente. "
+        "Cada instancia tiene sus propios mundos y mods.",
+        "Nova Staff"),
+}
 
 
 # --------------------------------------------------------------------------
@@ -972,10 +977,14 @@ def run_gui():
     import tkinter as tk
     from tkinter import ttk, messagebox, filedialog
 
-    BG, SIDE, CARD, CARD2, LINE = "#0d0f14", "#11141b", "#171b25", "#202636", "#262c3b"
-    FG, MUTED, ACCENT = "#e9ecf4", "#8a90a2", "#5b8cff"
+    BG, CARD, CARD2, LINE = "#080b14", "#121726", "#1a2036", "#252d47"
+    CARDH = "#0d1328"          # tarjetas de la pantalla de inicio
+    DOCK, PILL = "#070911", "#161a28"
+    FG, MUTED, ACCENT, ACCENT_H = "#e9ecf4", "#8a90a2", "#3a8ad8", "#5aa2ee"
+    GOLD = "#d9a21b"
     GREEN, GREEN_H, DIS = "#2fbf71", "#3bd983", "#262b38"
     RED, RED_H = "#c0455a", "#e0556c"
+    OK, BAD = "#38c172", "#ff6b81"
     FONT = "Segoe UI"
     LOADER_LABELS = ["Vanilla (sin mods)", "Fabric", "Quilt", "Forge", "NeoForge"]
     LOADER_KEYS = ["vanilla", "fabric", "quilt", "forge", "neoforge"]
@@ -1000,17 +1009,24 @@ def run_gui():
         return int(round(n * SC))
 
     def blend(c1, c2, t):
+        t = max(0.0, min(1.0, t))
         a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
         b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
         return "#%02x%02x%02x" % tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+    def round_rect(cv, x1, y1, x2, y2, r, **kw):
+        pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+               x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+        return cv.create_polygon(pts, smooth=True, **kw)
 
     class RoundButton(tk.Canvas):
         """Botón con esquinas redondeadas."""
 
         def __init__(self, parent, text, command, color, hover, parent_bg,
-                     font=(FONT, 15, "bold"), height=54, radius=14, fg="white"):
+                     font=(FONT, 15, "bold"), height=54, radius=14, fg="white", width=None):
+            kw = {"width": px(width)} if width else {}
             super().__init__(parent, height=px(height), bg=parent_bg, highlightthickness=0,
-                             bd=0, cursor="hand2")
+                             bd=0, cursor="hand2", **kw)
             self.text, self.command, self.color, self.hover = text, command, color, hover
             self.fg, self.font, self.r = fg, font, px(radius)
             self.enabled, self.over = True, False
@@ -1038,10 +1054,7 @@ def run_gui():
             if w < 4:
                 return
             fill = DIS if not self.enabled else (self.hover if self.over else self.color)
-            x1, y1, x2, y2 = 1, 1, w - 1, h - 1
-            pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
-                   x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
-            self.create_polygon(pts, smooth=True, fill=fill, outline=fill)
+            round_rect(self, 1, 1, w - 1, h - 1, r, fill=fill, outline=fill)
             self.create_text(w / 2, h / 2, text=self.text, font=self.font,
                              fill=self.fg if self.enabled else MUTED)
 
@@ -1084,16 +1097,17 @@ def run_gui():
     style.map("TCombobox", fieldbackground=[("readonly", CARD2), ("disabled", CARD)],
               foreground=[("readonly", FG), ("disabled", MUTED)],
               selectbackground=[("readonly", CARD2)])
-    style.configure("Nova.Horizontal.TProgressbar", troughcolor=CARD, background=ACCENT,
-                    bordercolor=CARD, lightcolor=ACCENT, darkcolor=ACCENT, thickness=px(8))
-    style.configure("Nova.Horizontal.TScale", background=CARD, troughcolor=CARD2)
+    style.configure("Nova.Horizontal.TProgressbar", troughcolor=DOCK, background=ACCENT,
+                    bordercolor=DOCK, lightcolor=ACCENT, darkcolor=ACCENT, thickness=px(4))
+    style.configure("Nova.Horizontal.TScale", background=BG, troughcolor=CARD2)
     root.option_add("*TCombobox*Listbox.background", CARD2)
     root.option_add("*TCombobox*Listbox.foreground", FG)
     root.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
     root.option_add("*TCombobox*Listbox.font", (FONT, 11))
 
     msgs = queue.Queue()
-    state = {"manifest": None, "busy": False, "page": "play", "lv_cb": None}
+    state = {"manifest": None, "busy": False, "page": "play", "lv_cb": None, "playing": "",
+             "hits": [], "net": {"mojang": None, "modrinth": None}}
     max_ram = max(2048, min(32768, int(total_ram_mb() * 0.75)))
 
     user_var = tk.StringVar(value=cfg["username"])
@@ -1103,11 +1117,8 @@ def run_gui():
     con_var = tk.BooleanVar(value=cfg["show_console"])
     scale_var = tk.StringVar(value=SCALES[0] if not us else f"{us}%")
     sel_var = tk.StringVar()
+    news_var = tk.StringVar(value=list(NEWS)[0])
     status_var = tk.StringVar(value="Cargando versiones...")
-    ram_text = tk.StringVar(value="—")
-    loader_text = tk.StringVar(value="—")
-    time_text = tk.StringVar(value="—")
-    mode_var = tk.StringVar(value="Offline")
 
     def instances():
         return cfg["instances"]
@@ -1122,53 +1133,6 @@ def run_gui():
         inst = get_inst(iid)
         if inst:
             fn(inst)
-
-    # ================================================================== sidebar
-    DARK = "#0a0c11"
-    sidebar = tk.Frame(root, bg=SIDE, width=px(96))
-    sidebar.pack(side="left", fill="y")
-    sidebar.pack_propagate(False)
-    tk.Label(sidebar, text="N", font=(FONT, 20, "bold"), fg="white", bg=ACCENT).pack(
-        pady=(px(24), px(26)), ipadx=px(15), ipady=px(4))
-
-    nav, pages = {}, {}
-
-    def style_nav(name, hover=False):
-        row, bar, box, g, t = nav[name]
-        active = state["page"] == name
-        bg = CARD if (active or hover) else SIDE
-        fg = ACCENT if active else (FG if hover else MUTED)
-        for w in (row, box):
-            w.configure(bg=bg)
-        bar.configure(bg=ACCENT if active else bg)
-        g.configure(bg=bg, fg=fg)
-        t.configure(bg=bg, fg=FG if (active or hover) else MUTED)
-
-    def make_nav(glyph, text, name):
-        row = tk.Frame(sidebar, bg=SIDE, cursor="hand2")
-        row.pack(fill="x", pady=2)
-        bar = tk.Frame(row, bg=SIDE, width=px(4))
-        bar.pack(side="left", fill="y")
-        box = tk.Frame(row, bg=SIDE)
-        box.pack(side="left", fill="x", expand=True, pady=px(10))
-        g = tk.Label(box, text=glyph, font=(FONT, 18), fg=MUTED, bg=SIDE)
-        g.pack()
-        t = tk.Label(box, text=text, font=(FONT, 8), fg=MUTED, bg=SIDE)
-        t.pack()
-        nav[name] = (row, bar, box, g, t)
-        for w in (row, bar, box, g, t):
-            w.bind("<Button-1>", lambda e, n=name: show_page(n))
-            w.bind("<Enter>", lambda e, n=name: style_nav(n, True))
-            w.bind("<Leave>", lambda e, n=name: style_nav(n, False))
-
-    make_nav("⌂", "Inicio", "play")
-    make_nav("▦", "Instancias", "instances")
-    make_nav("✦", "Tienda", "mods")
-    make_nav("⚙", "Ajustes", "settings")
-    make_nav("≡", "Consola", "console")
-
-    side_bottom = tk.Frame(sidebar, bg=SIDE)
-    side_bottom.pack(side="bottom", fill="x", pady=px(14))
 
     def open_folder(path):
         os.makedirs(path, exist_ok=True)
@@ -1186,14 +1150,6 @@ def run_gui():
         b.bind("<Leave>", lambda e: b.config(bg=bg))
         return b
 
-    fld = tk.Label(side_bottom, text="▣\nDatos", font=(FONT, 9), fg=MUTED, bg=SIDE, cursor="hand2")
-    fld.pack()
-    fld.bind("<Button-1>", lambda e: open_folder(ROOT))
-    tk.Label(side_bottom, text=f"v{APP_VERSION}", font=(FONT, 8), fg=MUTED, bg=SIDE).pack(pady=(px(8), 0))
-
-    content = tk.Frame(root, bg=BG)
-    content.pack(side="left", fill="both", expand=True)
-
     def card(parent, **kw):
         return tk.Frame(parent, bg=CARD, highlightthickness=1, highlightbackground=LINE, **kw)
 
@@ -1203,16 +1159,84 @@ def run_gui():
     def page_title(parent, text):
         return tk.Label(parent, text=text, font=(FONT, 22, "bold"), fg=FG, bg=BG)
 
-    # ================================================================== INICIO
-    play = tk.Frame(content, bg=BG)
-    pages["play"] = play
-    scene = tk.Canvas(play, bg=BG, highlightthickness=0, bd=0)
-    scene.place(x=0, y=0, relwidth=1.0, relheight=1.0)
+    # ================================================================== barra dorada
+    header = tk.Canvas(root, height=px(32), bg=BG, highlightthickness=0, bd=0)
+    header.pack(side="top", fill="x")
 
-    def round_rect(cv, x1, y1, x2, y2, r, **kw):
-        pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
-               x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
-        return cv.create_polygon(pts, smooth=True, **kw)
+    def draw_header(_=None):
+        w, h = header.winfo_width(), header.winfo_height()
+        if w < 20:
+            return
+        header.delete("all")
+        for x in range(0, w, 3):
+            t = x / w
+            col = blend("#c98f10", "#7a5208", t * 0.6) if t < 0.5 else blend("#a87a0e", "#14110a", (t - 0.5) * 1.5)
+            header.create_rectangle(x, 0, x + 3, h, fill=col, outline="")
+        header.create_text(px(12), h / 2, anchor="w", text=f"{APP_NAME} {APP_VERSION} Premium Edition",
+                           fill="white", font=(FONT, 10, "bold"))
+
+    header.bind("<Configure>", draw_header)
+
+    # ================================================================== barra flotante inferior
+    dockf = tk.Frame(root, bg=DOCK)
+    dockf.pack(side="bottom", fill="x")
+    bar = ttk.Progressbar(dockf, mode="determinate", style="Nova.Horizontal.TProgressbar")
+    bar.pack(fill="x")
+    tk.Label(dockf, textvariable=status_var, font=(FONT, 9), fg=MUTED, bg=DOCK).pack(pady=(px(6), 0))
+    pill = tk.Canvas(dockf, height=px(62), bg=DOCK, highlightthickness=0, bd=0)
+    pill.pack(fill="x")
+
+    content = tk.Frame(root, bg=BG)
+    content.pack(side="top", fill="both", expand=True)
+    pages = {}
+
+    def show_page(name):
+        for f in pages.values():
+            f.pack_forget()
+        state["page"] = name
+        pages[name].pack(fill="both", expand=True)
+        if name == "mods":
+            mods_enter()
+
+    dock_items = [("⌂  Inicio", lambda: show_page("play")),
+                  ("✦  Mods", lambda: show_page("mods")),
+                  ("≡  Consola", lambda: show_page("console")),
+                  ("⚙  Ajustes", lambda: show_page("settings")),
+                  ("▣  Instancias", lambda: show_page("instances")),
+                  ("⬇  Descargar", lambda: open_instance_dialog(None))]
+    dock_btns = [RoundButton(pill, t, fn, ACCENT, ACCENT_H, PILL, font=(FONT, 10, "bold"),
+                             height=34, radius=10, width=len(t) * 7 + 34) for t, fn in dock_items]
+    play_btn = RoundButton(pill, "▶  Jugar", lambda: on_play(), GREEN, GREEN_H, PILL,
+                           font=(FONT, 10, "bold"), height=34, radius=10, width=130)
+    dock_btns.append(play_btn)
+
+    def draw_dock(_=None):
+        w = pill.winfo_width()
+        if w < 100:
+            return
+        pill.delete("all")
+        gap, ph, y0 = px(8), px(48), px(6)
+        widths = [px(int(b.winfo_reqwidth() / SC)) if False else int(float(b.cget("width")))
+                  for b in dock_btns]
+        total = sum(widths) + gap * (len(widths) + 1)
+        x = (w - total) // 2
+        round_rect(pill, x, y0, x + total, y0 + ph, px(16), fill=PILL, outline=LINE)
+        x += gap
+        for b, wd in zip(dock_btns, widths):
+            pill.create_window(x, y0 + ph // 2, window=b, anchor="w", width=wd, height=px(34))
+            x += wd + gap
+
+    pill.bind("<Configure>", draw_dock)
+
+    # ================================================================== INICIO
+    scene = tk.Canvas(content, bg=BG, highlightthickness=0, bd=0)
+    pages["play"] = scene
+
+    news_box = ttk.Combobox(scene, textvariable=news_var, values=list(NEWS), state="readonly",
+                            font=(FONT, 9), width=18)
+    inst_box = ttk.Combobox(scene, textvariable=sel_var, state="readonly", font=(FONT, 11), width=24)
+    ver_btn = RoundButton(scene, "Ver instancias →", lambda: show_page("instances"), ACCENT, ACCENT_H,
+                          "#0d1328", font=(FONT, 9, "bold"), height=30, radius=9, width=140)
 
     def heights(w, seed, base, amp, step):
         r = random.Random(seed)
@@ -1223,113 +1247,162 @@ def run_gui():
             out.append(int((base + amp * v) // step * step))
         return out
 
+    def net_status(key):
+        v = state["net"][key]
+        if key == "mojang" and v is None and state["manifest"]:
+            v = True
+        if v is None:
+            return "Comprobando...", MUTED
+        return ("Operativo", OK) if v else ("Sin conexión", BAD)
+
     def draw_scene(_=None):
         w, h = scene.winfo_width(), scene.winfo_height()
-        if w < 60 or h < 60:
+        if w < 300 or h < 260:
             return
         scene.delete("all")
-        sky_top, sky_low = "#141d45", "#f09a68"
-        for y in range(0, h, 3):
-            scene.create_line(0, y, w, y, fill=blend(sky_top, sky_low, min(1.0, y / h * 1.3)), width=3)
-        rng = random.Random(11)
-        for _i in range(70):
-            x, y, z = rng.randrange(w), rng.randrange(int(h * 0.4)), px(rng.choice([1, 2]))
-            scene.create_rectangle(x, y, x + z, y + z, fill=blend(sky_top, "#ffffff", 0.3 + rng.random() * 0.6),
-                                   outline="")
-        sx, sy, r0 = int(w * 0.74), int(h * 0.36), px(50)
-        for k, (grow, col) in enumerate(((1.9, "#6b4a63"), (1.5, "#b8707a"), (1.2, "#e79a6c"), (1.0, "#ffd27a"))):
-            rr = int(r0 * grow)
-            scene.create_rectangle(sx - rr, sy - rr, sx + rr, sy + rr, fill=col, outline="")
-        for cxr, cyr, n in ((0.18, 0.30, 5), (0.52, 0.22, 4), (0.88, 0.14, 6), (0.35, 0.44, 3)):
-            bw, bh = px(30), px(16)
-            for i in range(n):
-                x0 = int(w * cxr) + i * bw
-                y0 = int(h * cyr) - (i % 2) * bh
-                scene.create_rectangle(x0, y0, x0 + bw, y0 + bh, fill=blend(sky_top, "#ffffff", 0.35), outline="")
-        step = px(24)
-        for seed, base, amp, col in ((3, 0.60, 0.09, "#343a78"), (7, 0.68, 0.07, "#25506b")):
+        state["hits"] = []
+
+        def txt(x, y, s, size, fill=FG, bold=False, anchor="w", width=None):
+            kw = {"width": width} if width else {}
+            return scene.create_text(x, y, anchor=anchor, text=s, fill=fill,
+                                     font=(FONT, size, "bold" if bold else "normal"), **kw)
+
+        # --- cielo nocturno y vía láctea
+        sky0, sky1 = "#04060e", "#101d3f"
+        for y in range(0, h, 4):
+            scene.create_line(0, y, w, y, fill=blend(sky0, sky1, y / h), width=4)
+        rng = random.Random(21)
+        ax, ay, bx, by = w * 0.80, -h * 0.05, w * 0.40, h * 0.85
+        for _i in range(520):
+            t = rng.random()
+            x = ax + (bx - ax) * t + rng.gauss(0, w * 0.055)
+            y = ay + (by - ay) * t + rng.gauss(0, h * 0.05)
+            z = px(rng.choice([1, 1, 2]))
+            scene.create_rectangle(x, y, x + z, y + z,
+                                   fill=blend(sky1, "#9db2e6", 0.15 + rng.random() * 0.5), outline="")
+        for _i in range(130):
+            x, y, z = rng.randrange(w), rng.randrange(int(h * 0.7)), px(rng.choice([1, 2]))
+            scene.create_rectangle(x, y, x + z, y + z,
+                                   fill=blend(sky0, "#ffffff", 0.4 + rng.random() * 0.6), outline="")
+        # --- terreno nevado en bloques
+        step = px(22)
+        for seed, base, amp, col in ((5, 0.74, 0.05, "#0e1730"), (9, 0.80, 0.04, "#14213f")):
             for i, hy in enumerate(heights(w, seed, h * base, h * amp, step)):
                 scene.create_rectangle(i * step, hy, i * step + step, h, fill=col, outline="")
-        near = heights(w, 13, h * 0.76, h * 0.045, step)
-        rr2 = random.Random(5)
-        for i, hy in enumerate(near):
+        rr = random.Random(7)
+        for i, hy in enumerate(heights(w, 17, h * 0.88, h * 0.03, step)):
             x0 = i * step
             scene.create_rectangle(x0, hy, x0 + step, hy + step // 2,
-                                   fill=blend("#4fb552", "#7be07e", rr2.random() * 0.5), outline="")
-            scene.create_rectangle(x0, hy + step // 2, x0 + step, hy + step,
-                                   fill=blend("#3f8f45", "#4a9a4a", rr2.random()), outline="")
-            scene.create_rectangle(x0, hy + step, x0 + step, h,
-                                   fill=blend("#6d4b31", "#7a5638", rr2.random()), outline="")
-            if i % 9 == 4:
-                scene.create_rectangle(x0 + step * 0.35, hy - step * 2, x0 + step * 0.65, hy, fill="#5a3d26", outline="")
-                scene.create_rectangle(x0 - step, hy - step * 4, x0 + step * 2, hy - step * 2, fill="#2f7a3d", outline="")
-                scene.create_rectangle(x0, hy - step * 5, x0 + step, hy - step * 4, fill="#3a8f49", outline="")
-        # textos
+                                   fill=blend("#8fa3c9", "#c9d6ee", rr.random() * 0.6), outline="")
+            scene.create_rectangle(x0, hy + step // 2, x0 + step, h,
+                                   fill=blend("#101a30", "#18233f", rr.random()), outline="")
+
+        # --- geometría
+        m = px(28)
+        lw = int(w * 0.60)
+        x0 = m + lw + px(28)
+        rw = max(px(240), w - m - x0)
+
+        # --- columna izquierda: novedades
+        txt(m + 2, px(42) + 2, "Últimas novedades de Nova", 22, "#02030a", True)
+        txt(m, px(42), "Últimas novedades de Nova", 22, "white", True)
+        scene.create_window(m + lw, px(42), window=news_box, anchor="e", width=px(170))
+        n_title, n_body, n_author = NEWS.get(news_var.get(), list(NEWS.values())[0])
+        y1, y2 = px(78), int(h * 0.64)
+        round_rect(scene, m, y1, m + lw, y2, px(14), fill=CARDH, outline=LINE)
+        txt(m + px(18), y1 + px(30), n_title, 17, "#c9ced9", True)
+        txt(m + lw - px(18), y1 + px(26), time.strftime("%d").lstrip("0"), 15, "#c9ced9", True, "e")
+        txt(m + lw - px(18), y1 + px(46), MESES[int(time.strftime("%m")) - 1], 9, "#aeb5c6", True, "e")
+        txt(m + px(18), y1 + px(62), n_body, 11, "#aeb5c6", False, "nw", lw - px(36))
+        iy = y1 + px(112)
+        ih = max(px(50), y2 - iy - px(40))
+        iw = min(px(300), lw - px(36))
+        round_rect(scene, m + px(18), iy, m + px(18) + iw, iy + ih, px(10), fill="#080d1c", outline=LINE)
+        s = min(ih - px(24), px(80))
+        cx, cy = m + px(18) + iw // 2, iy + ih // 2
+        scene.create_rectangle(cx - s - px(34), cy - s // 2, cx - px(34), cy + s // 2,
+                               outline=GOLD, width=px(5), fill="")
+        txt(cx - s // 2 - px(34), cy, "N", max(14, int(s / SC * 0.45)), GOLD, True, "center")
+        txt(cx, cy, "×", 22, "#9aa3b8", True, "center")
+        c0 = cx + px(34)
+        scene.create_rectangle(c0, cy - s // 2, c0 + s, cy - s // 2 + s // 3, fill="#4fb552", outline="")
+        scene.create_rectangle(c0, cy - s // 2 + s // 3, c0 + s, cy + s // 2, fill="#6d4b31", outline="")
+        txt(m + lw - px(18), y2 - px(18), f"⚒ {n_author}", 9, "#9aa3b8", True, "e")
+
+        # --- jugador activo
+        ty = y2 + px(44)
+        txt(m + 2, ty + 2, "Jugador activo", 20, "#02030a", True)
+        txt(m, ty, "Jugador activo", 20, "white", True)
+        scene.create_window(m + lw, ty, window=ver_btn, anchor="e", width=px(140), height=px(30))
         name = user_var.get().strip() or "Jugador"
         inst = cur()
-        sub = describe(inst) if inst else "Creá una instancia para empezar"
-        scene.create_text(px(52) + 2, int(h * 0.20) + 2, anchor="w", text=f"Hola, {name}", fill="#0b0d18",
-                          font=(FONT, 36, "bold"))
-        scene.create_text(px(52), int(h * 0.20), anchor="w", text=f"Hola, {name}", fill="white",
-                          font=(FONT, 36, "bold"))
-        scene.create_text(px(54), int(h * 0.20) + px(46), anchor="w", text=sub, fill="#ffe1c9",
-                          font=(FONT, 13))
-        x, y = px(54), int(h * 0.20) + px(78)
-        for txt in (ram_text.get(), loader_text.get(), time_text.get()):
-            wp = len(txt) * px(8) + px(34)
-            round_rect(scene, x, y, x + wp, y + px(32), px(16), fill=DARK, outline="")
-            scene.create_text(x + wp / 2, y + px(16), text=txt, fill=FG, font=(FONT, 10, "bold"))
-            x += wp + px(10)
-        # chip de usuario
-        cx2, cy2 = w - px(24), px(22)
-        cw = px(190)
-        round_rect(scene, cx2 - cw, cy2, cx2, cy2 + px(46), px(14), fill=DARK, outline="")
-        scene.create_rectangle(cx2 - cw + px(8), cy2 + px(8), cx2 - cw + px(38), cy2 + px(38),
+        ry = ty + px(24)
+        rh = px(56)
+        round_rect(scene, m, ry, m + px(320), ry + rh, px(12), fill=CARDH, outline=LINE)
+        scene.create_rectangle(m + px(10), ry + px(10), m + px(10) + px(36), ry + px(46),
                                fill=accent_for(name), outline="")
-        scene.create_text(cx2 - cw + px(23), cy2 + px(23), text=name[:1].upper(), fill="white",
-                          font=(FONT, 13, "bold"))
-        scene.create_text(cx2 - cw + px(48), cy2 + px(23), anchor="w", text=name[:14], fill=FG,
-                          font=(FONT, 11, "bold"))
+        txt(m + px(28), ry + px(28), name[:1].upper(), 14, "white", True, "center")
+        txt(m + px(58), ry + px(19), name[:20], 11, FG, True)
+        stt = f"Jugando {state['playing']}" if state["playing"] else "En el menú de inicio"
+        txt(m + px(58), ry + px(39), stt, 9, "#9aa3b8")
+        state["hits"].append((m, ry, m + px(320), ry + rh, "settings"))
+        txt(m + px(340), ry + px(10), "INSTANCIA", 8, "#9aa3b8", True)
+        scene.create_window(m + px(340), ry + px(38), window=inst_box, anchor="w", width=px(240))
+        if not inst:
+            txt(m, ry + rh + px(14), "Creá una instancia para empezar (botón Descargar).", 9, "#ffe1c9")
+        else:
+            txt(m, ry + rh + px(14), describe(inst), 9, "#9aa3b8")
 
-    draw_hero = draw_scene
+        # --- columna derecha: estado
+        txt(x0 + 2, px(46) + 2, "Estado de Nova", 22, "#02030a", True)
+        txt(x0, px(46), "Estado de Nova", 22, "white", True)
+
+        def mini(x, y, cw, chh, title, sub, subcol, glyph="N", bold_title=True, tsize=11):
+            round_rect(scene, x, y, x + cw, y + chh, px(12), fill=CARDH, outline=LINE)
+            if glyph:
+                scene.create_rectangle(x + px(12), y + (chh - px(26)) // 2, x + px(38),
+                                       y + (chh + px(26)) // 2, outline=GOLD, width=2, fill="")
+                txt(x + px(25), y + chh // 2, glyph, 11, GOLD, True, "center")
+            tx = x + (px(50) if glyph else px(14))
+            if sub:
+                txt(tx, y + chh * 0.36, title, tsize, "#c9ced9", bold_title)
+                txt(tx, y + chh * 0.72, sub, 8, subcol)
+            else:
+                txt(tx, y + chh // 2, title, tsize, "#c9ced9", bold_title)
+
+        cw2 = (rw - px(10)) // 2
+        st, sc_ = net_status("mojang")
+        mini(x0, px(78), cw2, px(56), "Mojang", st, sc_)
+        st, sc_ = net_status("modrinth")
+        mini(x0 + cw2 + px(10), px(78), cw2, px(56), "Modrinth", st, sc_)
+        n = len(instances())
+        total = sum(int(i.get("playtime", 0)) for i in instances())
+        mini(x0, px(146), rw, px(50), f"{n} instancia{'s' if n != 1 else ''}  ·  {fmt_time(total)}",
+             "", MUTED, "▣", True, 12)
+        state["hits"].append((x0, px(146), x0 + rw, px(196), "instances"))
+        if state["playing"]:
+            mini(x0, px(208), rw, px(66), "♪ Jugando ahora", state["playing"], "#9aa3b8", "", True, 12)
+        else:
+            mini(x0, px(208), rw, px(66), "♪ Jugando ahora", "Nada en ejecución", "#9aa3b8", "", True, 12)
+
+    news_box.bind("<<ComboboxSelected>>", lambda e: draw_scene())
     scene.bind("<Configure>", draw_scene)
-    scene.bind("<Button-1>", lambda e: show_page("settings")
-               if (e.x > scene.winfo_width() - px(220) and e.y < px(70)) else None)
+    scene.bind("<Button-1>", lambda e: next(
+        (show_page(p) for (a, b, c, d, p) in state["hits"] if a <= e.x <= c and b <= e.y <= d), None))
     user_var.trace_add("write", lambda *a: draw_scene())
-
-    bottom = tk.Frame(play, bg=DARK)
-    bottom.place(x=0, rely=1.0, relwidth=1.0, anchor="sw", height=px(104))
-    bl = tk.Frame(bottom, bg=DARK)
-    bl.pack(side="left", padx=(px(34), px(10)), pady=px(14))
-    small_title(bl, "INSTANCIA", bg=DARK).pack(anchor="w")
-    row = tk.Frame(bl, bg=DARK)
-    row.pack(anchor="w", pady=(px(5), 0))
-    inst_box = ttk.Combobox(row, textvariable=sel_var, state="readonly", font=(FONT, 12), width=24)
-    inst_box.pack(side="left", ipady=px(4))
-    flat_btn(row, "Gestionar", lambda: show_page("instances"), bg=CARD, hover=CARD2).pack(
-        side="left", padx=(px(8), 0), ipadx=px(12), ipady=px(6))
-    play_btn = RoundButton(bottom, "JUGAR", lambda: on_play(), GREEN, GREEN_H, DARK, height=62)
-    play_btn.configure(width=px(270))
-    play_btn.pack(side="right", padx=px(34), pady=px(20))
-    mid = tk.Frame(bottom, bg=DARK)
-    mid.pack(side="left", fill="x", expand=True, padx=px(16))
-    tk.Label(mid, textvariable=status_var, font=(FONT, 9), fg=MUTED, bg=DARK, anchor="w").pack(
-        fill="x", pady=(px(20), 0))
-    bar = ttk.Progressbar(mid, mode="determinate", style="Nova.Horizontal.TProgressbar")
-    bar.pack(fill="x", pady=(px(8), 0))
 
     # ================================================================== INSTANCIAS
     inst_page = tk.Frame(content, bg=BG)
     pages["instances"] = inst_page
     ih = tk.Frame(inst_page, bg=BG)
-    ih.pack(fill="x", padx=px(36), pady=(px(28), px(14)))
+    ih.pack(fill="x", padx=px(36), pady=(px(22), px(10)))
     page_title(ih, "Instancias").pack(side="left")
-    RoundButton(ih, "＋  Nueva instancia", lambda: open_instance_dialog(None), ACCENT, "#7ba3ff", BG,
+    RoundButton(ih, "＋  Nueva instancia", lambda: open_instance_dialog(None), ACCENT, ACCENT_H, BG,
                 font=(FONT, 11, "bold"), height=42, radius=12).pack(side="right", ipadx=px(26))
     tk.Label(inst_page, text="Cada instancia tiene su propia versión, mods, mundos y opciones.",
              font=(FONT, 10), fg=MUTED, bg=BG).pack(anchor="w", padx=px(38), pady=(0, px(10)))
     ilist = ScrollFrame(inst_page, BG)
-    ilist.pack(fill="both", expand=True, padx=(px(36), px(20)), pady=(0, px(20)))
+    ilist.pack(fill="both", expand=True, padx=(px(36), px(20)), pady=(0, px(10)))
 
     def build_instances():
         for w in ilist.inner.winfo_children():
@@ -1354,11 +1427,11 @@ def run_gui():
             iid = inst["id"]
             flat_btn(right, "Jugar", lambda i=iid: play_instance(i), bg=GREEN, hover=GREEN_H,
                      fg="white", size=10).pack(side="left", padx=px(3), ipadx=px(14), ipady=px(6))
-            for txt, fn in (("Editar", lambda i=iid: on_inst(i, open_instance_dialog)),
-                            ("Mods", lambda i=iid: open_mods_for(i)),
-                            ("Duplicar", lambda i=iid: on_inst(i, duplicate_instance)),
-                            ("Carpeta", lambda i=iid: on_inst(i, lambda x: open_folder(game_dir(x))))):
-                flat_btn(right, txt, fn, bg=CARD2, hover=LINE).pack(
+            for txt_, fn in (("Editar", lambda i=iid: on_inst(i, open_instance_dialog)),
+                             ("Mods", lambda i=iid: open_mods_for(i)),
+                             ("Duplicar", lambda i=iid: on_inst(i, duplicate_instance)),
+                             ("Carpeta", lambda i=iid: on_inst(i, lambda x: open_folder(game_dir(x))))):
+                flat_btn(right, txt_, fn, bg=CARD2, hover=LINE).pack(
                     side="left", padx=px(3), ipadx=px(10), ipady=px(6))
             flat_btn(right, "Eliminar", lambda i=iid: delete_instance(i), bg=CARD2, hover=RED,
                      fg="#ff8a9b").pack(side="left", padx=px(3), ipadx=px(10), ipady=px(6))
@@ -1401,12 +1474,12 @@ def run_gui():
         save_all()
         refresh_all()
 
-    # ================================================================== TIENDA
+    # ================================================================== TIENDA (mods)
     mods_page = tk.Frame(content, bg=BG)
     pages["mods"] = mods_page
     mt = tk.Frame(mods_page, bg=BG)
-    mt.pack(fill="x", padx=px(36), pady=(px(26), px(4)))
-    page_title(mt, "Tienda").pack(side="left")
+    mt.pack(fill="x", padx=px(36), pady=(px(20), px(4)))
+    page_title(mt, "Mods").pack(side="left")
     mods_target = tk.StringVar(value="")
     tk.Label(mt, textvariable=mods_target, font=(FONT, 10), fg=MUTED, bg=BG).pack(
         side="left", padx=px(16), pady=(px(12), 0))
@@ -1442,14 +1515,14 @@ def run_gui():
                   relief="flat", highlightthickness=1, highlightbackground=LINE, highlightcolor=ACCENT)
     mq.pack(side="left", fill="x", expand=True, ipady=px(7))
     mq.bind("<Return>", lambda e: mods_search())
-    flat_btn(mrow, "Buscar", lambda: mods_search(), bg=ACCENT, hover="#7ba3ff", fg="white", size=10).pack(
+    flat_btn(mrow, "Buscar", lambda: mods_search(), bg=ACCENT, hover=ACCENT_H, fg="white", size=10).pack(
         side="left", padx=(px(8), 0), ipadx=px(20), ipady=px(7))
     mods_status = tk.StringVar(value="")
     mods_status_lbl = tk.Label(mods_page, textvariable=mods_status, font=(FONT, 10), fg=MUTED, bg=BG,
                                anchor="w", justify="left", wraplength=px(820))
     mods_status_lbl.pack(fill="x", padx=px(38), pady=(0, px(6)))
     mods_list = ScrollFrame(mods_page, BG)
-    mods_list.pack(fill="both", expand=True, padx=(px(36), px(20)), pady=(0, px(20)))
+    mods_list.pack(fill="both", expand=True, padx=(px(36), px(20)), pady=(0, px(10)))
     mods_list.inner.columnconfigure(0, weight=1, uniform="g")
     mods_list.inner.columnconfigure(1, weight=1, uniform="g")
 
@@ -1532,7 +1605,7 @@ def run_gui():
         for k in ("fabric", "quilt", "forge", "neoforge"):
             main = k == "fabric"
             flat_btn(r, LOADER_NAMES[k], lambda kk=k: quick_create(kk), bg=ACCENT if main else CARD2,
-                     hover="#7ba3ff" if main else LINE, fg="white" if main else FG, size=10).pack(
+                     hover=ACCENT_H if main else LINE, fg="white" if main else FG, size=10).pack(
                 side="left", padx=(0, px(8)), ipadx=px(18), ipady=px(8))
         tk.Label(c, text="Las pestañas Texturas y Shaders sí funcionan en esta instancia.",
                  font=(FONT, 9), fg=MUTED, bg=CARD).pack(anchor="w", padx=px(22), pady=(0, px(16)))
@@ -1649,16 +1722,16 @@ def run_gui():
     # ================================================================== AJUSTES
     sett = tk.Frame(content, bg=BG)
     pages["settings"] = sett
-    page_title(sett, "Ajustes").pack(anchor="w", padx=px(36), pady=(px(28), px(14)))
+    page_title(sett, "Ajustes").pack(anchor="w", padx=px(36), pady=(px(22), px(12)))
     c1 = card(sett)
-    c1.pack(fill="x", padx=px(36), pady=(0, px(14)))
+    c1.pack(fill="x", padx=px(36), pady=(0, px(12)))
     small_title(c1, "NOMBRE DE USUARIO").pack(anchor="w", padx=px(20), pady=(px(14), px(6)))
     tk.Entry(c1, textvariable=user_var, font=(FONT, 12), bg=CARD2, fg=FG, insertbackground=FG,
              relief="flat", highlightthickness=1, highlightbackground=LINE,
              highlightcolor=ACCENT).pack(fill="x", padx=px(20), pady=(0, px(16)), ipady=px(7))
 
     c2 = card(sett)
-    c2.pack(fill="x", padx=px(36), pady=(0, px(14)))
+    c2.pack(fill="x", padx=px(36), pady=(0, px(12)))
     small_title(c2, "TAMAÑO DE LA INTERFAZ").pack(anchor="w", padx=px(20), pady=(px(14), px(6)))
     srow = tk.Frame(c2, bg=CARD)
     srow.pack(fill="x", padx=px(20), pady=(0, px(16)))
@@ -1669,7 +1742,7 @@ def run_gui():
              font=(FONT, 9), fg=MUTED, bg=CARD).pack(side="left", padx=px(14))
 
     c3 = card(sett)
-    c3.pack(fill="x", padx=px(36), pady=(0, px(14)))
+    c3.pack(fill="x", padx=px(36), pady=(0, px(12)))
     small_title(c3, "OPCIONES").pack(anchor="w", padx=px(20), pady=(px(14), px(4)))
 
     def check(parent, text, var, cmd=None):
@@ -1683,14 +1756,18 @@ def run_gui():
     check(c3, "Minimizar el launcher mientras juego", min_var)
     check(c3, "Mostrar la consola al iniciar el juego", con_var)
     tk.Frame(c3, bg=CARD, height=px(10)).pack()
-    tk.Label(sett, text=f"Datos guardados en:  {ROOT}", font=(FONT, 9), fg=MUTED, bg=BG,
-             anchor="w").pack(fill="x", padx=px(38), pady=(px(4), 0))
+    drow = tk.Frame(sett, bg=BG)
+    drow.pack(fill="x", padx=px(36), pady=(px(4), 0))
+    tk.Label(drow, text=f"Datos guardados en:  {ROOT}", font=(FONT, 9), fg=MUTED, bg=BG,
+             anchor="w").pack(side="left")
+    flat_btn(drow, "Abrir carpeta", lambda: open_folder(ROOT)).pack(
+        side="left", padx=px(12), ipadx=px(10), ipady=px(4))
 
     # ================================================================== CONSOLA
     cons = tk.Frame(content, bg=BG)
     pages["console"] = cons
     head = tk.Frame(cons, bg=BG)
-    head.pack(fill="x", padx=px(36), pady=(px(28), px(12)))
+    head.pack(fill="x", padx=px(36), pady=(px(22), px(10)))
     page_title(head, "Consola").pack(side="left")
     log_text = tk.Text(cons, bg=CARD, fg="#b7bccb", font=("Consolas", 9), relief="flat",
                        wrap="word", state="disabled", bd=0, padx=px(12), pady=px(10),
@@ -1710,8 +1787,8 @@ def run_gui():
         flat_btn(head, label, fn).pack(side="right", padx=(px(8), 0), ipadx=px(12), ipady=px(5))
     sb = tk.Scrollbar(cons, command=log_text.yview)
     log_text.configure(yscrollcommand=sb.set)
-    sb.pack(side="right", fill="y", padx=(0, px(36)), pady=(0, px(28)))
-    log_text.pack(side="left", fill="both", expand=True, padx=(px(36), 0), pady=(0, px(28)))
+    sb.pack(side="right", fill="y", padx=(0, px(36)), pady=(0, px(14)))
+    log_text.pack(side="left", fill="both", expand=True, padx=(px(36), 0), pady=(0, px(14)))
 
     def append_log(text):
         log_text.config(state="normal")
@@ -1719,32 +1796,12 @@ def run_gui():
         log_text.see("end")
         log_text.config(state="disabled")
 
-    # ================================================================== navegación / refresco
-    def show_page(name):
-        for f in pages.values():
-            f.pack_forget()
-        state["page"] = name
-        pages[name].pack(fill="both", expand=True)
-        for n in nav:
-            style_nav(n)
-        if name == "mods":
-            mods_enter()
-
+    # ================================================================== refresco
     def refresh_play():
-        names = [i["name"] for i in instances()]
-        inst_box["values"] = names
+        inst_box["values"] = [i["name"] for i in instances()]
         inst = cur()
-        if inst:
-            sel_var.set(inst["name"])
-            ram_text.set(f"{inst.get('ram_mb', 4096) / 1024:.1f} GB")
-            loader_text.set(LOADER_NAMES.get(inst["loader"], inst["loader"]))
-            time_text.set(fmt_time(inst.get("playtime", 0)))
-        else:
-            time_text.set("—")
-            sel_var.set("")
-            ram_text.set("—")
-            loader_text.set("—")
-        draw_hero()
+        sel_var.set(inst["name"] if inst else "")
+        draw_scene()
 
     def refresh_all():
         refresh_play()
@@ -1962,7 +2019,7 @@ def run_gui():
 
         flat_btn(footer, "Cancelar", dlg.destroy, size=10).pack(side="right", padx=(px(8), 0),
                                                                  ipadx=px(16), ipady=px(8))
-        flat_btn(footer, "Guardar" if editing else "Crear instancia", save, bg=ACCENT, hover="#7ba3ff",
+        flat_btn(footer, "Guardar" if editing else "Crear instancia", save, bg=ACCENT, hover=ACCENT_H,
                  fg="white", size=10).pack(side="right", ipadx=px(18), ipady=px(8))
         load_lv()
 
@@ -2007,7 +2064,7 @@ def run_gui():
             return
         save_all()
         state["busy"] = True
-        play_btn.set_state("PREPARANDO...", False)
+        play_btn.set_state("Preparando…", False)
         status_var.set("Preparando...")
         threading.Thread(target=worker, args=(inst, name), daemon=True).start()
 
@@ -2017,9 +2074,16 @@ def run_gui():
         try:
             state["manifest"] = load_manifest()
             msgs.put(("manifest",))
+            msgs.put(("net", "mojang", True))
         except Exception as e:
             msgs.put(("log", f"No se pudo cargar la lista de versiones: {e}"))
             msgs.put(("status", "Sin conexión con Mojang"))
+            msgs.put(("net", "mojang", False))
+        try:
+            fetch_json(MODRINTH, timeout=10)
+            msgs.put(("net", "modrinth", True))
+        except Exception:
+            msgs.put(("net", "modrinth", False))
 
     def pump():
         try:
@@ -2046,6 +2110,9 @@ def run_gui():
                             save_all()
                     refresh_all()
                     status_var.set("Listo para jugar")
+                elif kind == "net":
+                    state["net"][m[1]] = m[2]
+                    draw_scene()
                 elif kind == "lv":
                     if state["lv_cb"]:
                         state["lv_cb"](m[1], m[2])
@@ -2076,8 +2143,10 @@ def run_gui():
                     finish_quick(m[1], m[2], m[3])
                 elif kind == "started":
                     bar["value"] = 0
-                    play_btn.set_state("JUGANDO", False)
+                    state["playing"] = m[1]
+                    play_btn.set_state("Jugando", False)
                     status_var.set(f"{m[1]} en ejecución")
+                    draw_scene()
                     if con_var.get():
                         show_page("console")
                     if min_var.get():
@@ -2087,8 +2156,10 @@ def run_gui():
                     show_page("console")
                 elif kind == "idle":
                     state["busy"] = False
+                    state["playing"] = ""
                     bar["value"] = 0
-                    play_btn.set_state("JUGAR", True)
+                    play_btn.set_state("▶  Jugar", True)
+                    draw_scene()
                     if min_var.get():
                         root.deiconify()
         except queue.Empty:
