@@ -82,7 +82,8 @@
                         "Tienda de mods",
                         f"Se descargó {m[1]} en la carpeta mods.\n\n"
                         "Importante: el perfil del juego debe tener instalado el loader "
-                        "seleccionado (Fabric/Forge/NeoForge/Quilt) para que funcione."
+                        "seleccionado (Fabric/Forge/NeoForge/Quilt). Este launcher todavía "
+                        "no instala ni inicia automáticamente esos loaders."
                     )
                 elif kind == "mod_search_done":
                     mod_state["busy"] = False
