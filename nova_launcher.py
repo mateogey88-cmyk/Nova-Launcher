@@ -1,18 +1,39 @@
 #!/usr/bin/env python3
 """
-NovaLauncher 0.6 - launcher de Minecraft Java Edition en un solo archivo.
+NovaLauncher 0.7 - launcher de Minecraft Java Edition en un solo archivo.
+
+Novedades de la 0.7:
+  * Cuentas con contraseña (locales de este PC) y roles: administrador / usuario
+  * Panel de administración: cuentas, permisos, actividad, sistema
 
 Novedades de la 0.6:
-  * Interfaz estilo Battly: barra dorada, fondo nocturno, tarjetas de novedades y estado,
-    "Jugador activo" y barra flotante inferior (Inicio, Mods, Consola, Ajustes, Instancias,
-    Descargar, Jugar)
+  * Pantalla de inicio nocturna con novedades, estado de servicios y tus instancias
+  * Asistente IA (Claude): recomienda mods y explica los errores de la consola
 
-Requisitos: Python 3.8+ (con tkinter)
+Novedades de la 0.5:
+  * Interfaz nueva: pantalla de inicio con paisaje, barra lateral de iconos y barra de juego
+  * Tienda de mods, texturas y shaders (Modrinth) con cuadrícula; instancia Vanilla -> Fabric en 1 clic
+
+Novedades de la 0.4:
+  * Buscador e instalador de mods (Modrinth), con dependencias automáticas
+  * Duplicar instancias, tiempo jugado, colores por instancia
+  * Detección de cierres con error del juego
+
+Novedades de la 0.3:
+  * Instancias: varias versiones/instalaciones a la vez, cada una con sus mods,
+    mundos, RAM y opciones propias
+  * Mod loaders: Fabric, Quilt, Forge y NeoForge
+  * Más opciones: resolución del juego, pantalla completa, argumentos JVM,
+    perfil de rendimiento, Java personalizado
+  * Interfaz más grande y nítida (soporte de pantallas de alta resolución)
+
+Requisitos: Python 3.8+ (con tkinter, ya viene en el instalador de python.org)
 Uso:        python nova_launcher.py
 """
 
 import glob
 import hashlib
+import hmac
 import json
 import os
 import platform
@@ -33,7 +54,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 APP_NAME = "NovaLauncher"
-APP_VERSION = "0.6"
+APP_VERSION = "0.7"
 UA = f"NovaLauncher/{APP_VERSION} (launcher de Minecraft para amigos)"
 
 MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
@@ -562,13 +583,86 @@ def modrinth_install(project, mc, kind, dest_dir, _seen=None, depth=0, ptype="mo
 
 
 # --------------------------------------------------------------------------
+# Asistente IA (API de Anthropic - usa TU clave, se guarda solo en tu PC)
+# --------------------------------------------------------------------------
+AI_URL = "https://api.anthropic.com/v1/messages"
+AI_MODELS = ["claude-haiku-5-5", "claude-sonnet-5-5"]
+
+
+def post_json(url, payload, headers, timeout=90):
+    data = json.dumps(payload).encode("utf-8")
+    hdr = {"Content-Type": "application/json", "User-Agent": UA}
+    hdr.update(headers)
+    req = urllib.request.Request(url, data=data, headers=hdr, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        msg = ""
+        try:
+            msg = json.loads(e.read().decode("utf-8")).get("error", {}).get("message", "")
+        except Exception:
+            pass
+        raise RuntimeError(f"{e.code}: {msg}" if msg else f"{e.code}: el servicio respondió con error") from None
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"No hay conexión ({e.reason})") from None
+
+
+def ai_chat(api_key, model, system, messages):
+    out = post_json(AI_URL, {"model": model, "max_tokens": 1200, "system": system,
+                             "messages": messages},
+                    {"x-api-key": api_key, "anthropic-version": "2023-06-01"})
+    text = "".join(b.get("text", "") for b in out.get("content", []) if b.get("type") == "text")
+    return text.strip() or "(respuesta vacía)"
+
+
+def ai_system_prompt(inst, mods):
+    lines = ["Sos el asistente de NovaLauncher, un launcher de Minecraft Java Edition. "
+             "Respondé en español rioplatense, claro, corto y con pasos concretos. "
+             "Si te pasan la consola del launcher, buscá la causa más probable del error y explicá cómo "
+             "arreglarlo (RAM, versión de Java, mods incompatibles, falta de dependencias como Fabric API, etc.). "
+             "No inventes mods ni versiones: si no estás seguro de que algo exista para esa versión, decilo y "
+             "sugerí buscarlo en la pestaña Tienda del launcher. No uses tablas."]
+    if inst:
+        lines.append(f"Instancia actual del jugador: {inst.get('name')} | Minecraft {inst.get('mc')} | "
+                     f"cargador: {LOADER_NAMES.get(inst.get('loader'), inst.get('loader'))} "
+                     f"{inst.get('loader_version') or ''} | RAM asignada: {inst.get('ram_mb', 4096)} MB.")
+        if mods:
+            lines.append("Mods instalados: " + ", ".join(mods[:60]))
+        elif inst.get("loader") != "vanilla":
+            lines.append("Todavía no tiene mods instalados.")
+    return "\n".join(lines)
+
+
+def clean_md(text):
+    out = []
+    for ln in text.splitlines():
+        ln = ln.replace("**", "").replace("__", "").replace("`", "")
+        ln = re.sub(r"^\s{0,3}#{1,6}\s*", "", ln)
+        ln = re.sub(r"^(\s*)[-*]\s+", r"\1• ", ln)
+        out.append(ln)
+    return "\n".join(out).strip()
+
+
+def installed_mod_names(inst):
+    if not inst:
+        return []
+    d = os.path.join(game_dir(inst), "mods")
+    try:
+        return sorted(f for f in os.listdir(d) if f.endswith(".jar"))
+    except OSError:
+        return []
+
+
+# --------------------------------------------------------------------------
 # Lanzador
 # --------------------------------------------------------------------------
 class Launcher:
-    def __init__(self, log, progress, on_change=None):
+    def __init__(self, log, progress, on_change=None, ram_cap=0):
         self.log = log
         self.progress = progress
         self.on_change = on_change or (lambda: None)
+        self.ram_cap = int(ram_cap or 0)
 
     def _download_many(self, tasks, label):
         total = len(tasks)
@@ -824,6 +918,8 @@ class Launcher:
 
         # opciones de la instancia
         ram = int(inst.get("ram_mb", 4096))
+        if self.ram_cap > 0:
+            ram = min(ram, self.ram_cap)
         cmd = [java, f"-Xmx{ram}M", f"-Xms{min(512, ram)}M"]
         cmd += JVM_PRESETS.get(inst.get("jvm_preset", "Por defecto"), [])
         extra = (inst.get("jvm_args") or "").strip()
@@ -870,7 +966,9 @@ def total_ram_mb():
 
 
 DEFAULT_CONFIG = {"username": "Player", "last_instance": "", "snapshots": False, "old": False,
-                  "minimize": False, "show_console": False, "ui_scale": 0, "instances": []}
+                  "minimize": False, "show_console": False, "ui_scale": 0, "instances": [],
+                  "ai_key": "", "ai_model": "claude-haiku-5-5",
+                  "accounts": [], "remember": "", "allow_signup": True, "audit": []}
 
 
 def new_instance(name, mc, loader="vanilla", loader_version="", ram_mb=4096):
@@ -894,6 +992,8 @@ def unique_name(name, instances, ignore_id=None):
 def load_config():
     cfg = dict(DEFAULT_CONFIG)
     cfg["instances"] = []
+    cfg["accounts"] = []
+    cfg["audit"] = []
     try:
         with open(CONFIG_FILE, encoding="utf-8") as f:
             cfg.update(json.load(f))
@@ -921,7 +1021,7 @@ def describe(inst):
     return f"{loader}  ·  Minecraft {inst['mc']}"
 
 
-PALETTE = ["#3a8ad8", "#2fbf71", "#e0a030", "#c0589a", "#38b6c9", "#9b6bff", "#e0603c"]
+PALETTE = ["#5b8cff", "#2fbf71", "#e0a030", "#c0589a", "#38b6c9", "#9b6bff", "#e0603c"]
 
 
 def accent_for(iid):
@@ -936,21 +1036,80 @@ def fmt_time(sec):
     return f"{h} h {m} min" if h else f"{m} min"
 
 
-MESES = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto",
-         "Septiembre", "Octubre", "Noviembre", "Diciembre"]
+# --------------------------------------------------------------------------
+# Cuentas locales (contraseñas con PBKDF2; los datos viven solo en este PC)
+# --------------------------------------------------------------------------
+USER_RE = re.compile(r"^[A-Za-z0-9_]{3,16}$")
+PW_MIN = 6
+PBKDF2_ITERS = 200_000
 
-NEWS = {
-    "Novedades de Nova": (
-        "¡Nueva interfaz en NovaLauncher!",
-        "Pantalla de inicio renovada, barra de acciones flotante y tienda de mods, "
-        "texturas y shaders con Modrinth.",
-        "Nova Staff"),
-    "Consejos": (
-        "Mods en un solo clic",
-        "Si tu instancia es Vanilla, entrá a Mods y creá una de Fabric automáticamente. "
-        "Cada instancia tiene sus propios mundos y mods.",
-        "Nova Staff"),
-}
+
+def hash_pw(password, salt=None):
+    salt = salt or os.urandom(16).hex()
+    h = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), PBKDF2_ITERS).hex()
+    return salt, h
+
+
+def check_pw(acct, password):
+    try:
+        _, h = hash_pw(password or "", acct.get("salt", ""))
+    except ValueError:
+        return False
+    return hmac.compare_digest(h, acct.get("hash", ""))
+
+
+def find_account(accounts, user):
+    u = (user or "").strip().lower()
+    return next((a for a in accounts if a.get("user", "").lower() == u), None)
+
+
+def validate_new_account(accounts, user, password):
+    if not USER_RE.match(user or ""):
+        return "El usuario debe tener 3 a 16 caracteres (letras, números o guion bajo)."
+    if find_account(accounts, user):
+        return "Ese usuario ya existe."
+    if len(password or "") < PW_MIN:
+        return f"La contraseña debe tener al menos {PW_MIN} caracteres."
+    return ""
+
+
+def new_account(user, password, role="user"):
+    salt, h = hash_pw(password)
+    return {"user": user, "salt": salt, "hash": h, "role": role, "enabled": True, "mc_name": user,
+            "created": time.strftime("%Y-%m-%d %H:%M"), "last_login": "", "playtime": 0,
+            "perms": {"store": True, "ai": True, "console": True, "ram_mb": 0}}
+
+
+def admin_count(accounts):
+    return sum(1 for a in accounts if a.get("role") == "admin" and a.get("enabled", True))
+
+
+def is_last_admin(accounts, acct):
+    return acct.get("role") == "admin" and acct.get("enabled", True) and admin_count(accounts) <= 1
+
+
+def audit_add(cfg, user, event, detail=""):
+    log = cfg.setdefault("audit", [])
+    log.append({"t": time.strftime("%Y-%m-%d %H:%M:%S"), "u": user, "e": event, "d": detail})
+    del log[:-300]
+
+
+def dir_size(path):
+    total = 0
+    for base, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(base, f))
+            except OSError:
+                pass
+    return total
+
+
+def fmt_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024.0
 
 
 # --------------------------------------------------------------------------
@@ -975,16 +1134,12 @@ def run_gui():
     import random
     set_dpi_awareness()
     import tkinter as tk
-    from tkinter import ttk, messagebox, filedialog
+    from tkinter import ttk, messagebox, filedialog, simpledialog
 
-    BG, CARD, CARD2, LINE = "#080b14", "#121726", "#1a2036", "#252d47"
-    CARDH = "#0d1328"          # tarjetas de la pantalla de inicio
-    DOCK, PILL = "#070911", "#161a28"
-    FG, MUTED, ACCENT, ACCENT_H = "#e9ecf4", "#8a90a2", "#3a8ad8", "#5aa2ee"
-    GOLD = "#d9a21b"
+    BG, SIDE, CARD, CARD2, LINE = "#0d0f14", "#11141b", "#171b25", "#202636", "#262c3b"
+    FG, MUTED, ACCENT = "#e9ecf4", "#8a90a2", "#5b8cff"
     GREEN, GREEN_H, DIS = "#2fbf71", "#3bd983", "#262b38"
     RED, RED_H = "#c0455a", "#e0556c"
-    OK, BAD = "#38c172", "#ff6b81"
     FONT = "Segoe UI"
     LOADER_LABELS = ["Vanilla (sin mods)", "Fabric", "Quilt", "Forge", "NeoForge"]
     LOADER_KEYS = ["vanilla", "fabric", "quilt", "forge", "neoforge"]
@@ -1009,24 +1164,17 @@ def run_gui():
         return int(round(n * SC))
 
     def blend(c1, c2, t):
-        t = max(0.0, min(1.0, t))
         a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
         b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
         return "#%02x%02x%02x" % tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
-
-    def round_rect(cv, x1, y1, x2, y2, r, **kw):
-        pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
-               x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
-        return cv.create_polygon(pts, smooth=True, **kw)
 
     class RoundButton(tk.Canvas):
         """Botón con esquinas redondeadas."""
 
         def __init__(self, parent, text, command, color, hover, parent_bg,
-                     font=(FONT, 15, "bold"), height=54, radius=14, fg="white", width=None):
-            kw = {"width": px(width)} if width else {}
+                     font=(FONT, 15, "bold"), height=54, radius=14, fg="white"):
             super().__init__(parent, height=px(height), bg=parent_bg, highlightthickness=0,
-                             bd=0, cursor="hand2", **kw)
+                             bd=0, cursor="hand2")
             self.text, self.command, self.color, self.hover = text, command, color, hover
             self.fg, self.font, self.r = fg, font, px(radius)
             self.enabled, self.over = True, False
@@ -1054,7 +1202,10 @@ def run_gui():
             if w < 4:
                 return
             fill = DIS if not self.enabled else (self.hover if self.over else self.color)
-            round_rect(self, 1, 1, w - 1, h - 1, r, fill=fill, outline=fill)
+            x1, y1, x2, y2 = 1, 1, w - 1, h - 1
+            pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+                   x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+            self.create_polygon(pts, smooth=True, fill=fill, outline=fill)
             self.create_text(w / 2, h / 2, text=self.text, font=self.font,
                              fill=self.fg if self.enabled else MUTED)
 
@@ -1097,28 +1248,31 @@ def run_gui():
     style.map("TCombobox", fieldbackground=[("readonly", CARD2), ("disabled", CARD)],
               foreground=[("readonly", FG), ("disabled", MUTED)],
               selectbackground=[("readonly", CARD2)])
-    style.configure("Nova.Horizontal.TProgressbar", troughcolor=DOCK, background=ACCENT,
-                    bordercolor=DOCK, lightcolor=ACCENT, darkcolor=ACCENT, thickness=px(4))
-    style.configure("Nova.Horizontal.TScale", background=BG, troughcolor=CARD2)
+    style.configure("Nova.Horizontal.TProgressbar", troughcolor=CARD, background=ACCENT,
+                    bordercolor=CARD, lightcolor=ACCENT, darkcolor=ACCENT, thickness=px(8))
+    style.configure("Nova.Horizontal.TScale", background=CARD, troughcolor=CARD2)
     root.option_add("*TCombobox*Listbox.background", CARD2)
     root.option_add("*TCombobox*Listbox.foreground", FG)
     root.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
     root.option_add("*TCombobox*Listbox.font", (FONT, 11))
 
     msgs = queue.Queue()
-    state = {"manifest": None, "busy": False, "page": "play", "lv_cb": None, "playing": "",
-             "hits": [], "net": {"mojang": None, "modrinth": None}}
+    state = {"manifest": None, "busy": False, "page": "play", "lv_cb": None, "acct": None}
     max_ram = max(2048, min(32768, int(total_ram_mb() * 0.75)))
 
     user_var = tk.StringVar(value=cfg["username"])
+    chip_var = tk.StringVar(value="")
     snap_var = tk.BooleanVar(value=cfg["snapshots"])
     old_var = tk.BooleanVar(value=cfg["old"])
     min_var = tk.BooleanVar(value=cfg["minimize"])
     con_var = tk.BooleanVar(value=cfg["show_console"])
     scale_var = tk.StringVar(value=SCALES[0] if not us else f"{us}%")
     sel_var = tk.StringVar()
-    news_var = tk.StringVar(value=list(NEWS)[0])
     status_var = tk.StringVar(value="Cargando versiones...")
+    ram_text = tk.StringVar(value="—")
+    loader_text = tk.StringVar(value="—")
+    time_text = tk.StringVar(value="—")
+    mode_var = tk.StringVar(value="Offline")
 
     def instances():
         return cfg["instances"]
@@ -1133,6 +1287,26 @@ def run_gui():
         inst = get_inst(iid)
         if inst:
             fn(inst)
+
+    def is_admin():
+        a = state.get("acct")
+        return bool(a and a.get("role") == "admin")
+
+    def allowed(perm):
+        a = state.get("acct")
+        if not a:
+            return False
+        return is_admin() or bool((a.get("perms") or {}).get(perm, True))
+
+    def audit_event(event, detail=""):
+        audit_add(cfg, (state.get("acct") or {}).get("user", "-"), event, detail)
+
+    # ================================================================== barra superior
+    DARK = "#0a0c11"
+    nav, pages = {}, {}
+
+    def style_nav(name, hover=False):
+        return None
 
     def open_folder(path):
         os.makedirs(path, exist_ok=True)
@@ -1150,6 +1324,36 @@ def run_gui():
         b.bind("<Leave>", lambda e: b.config(bg=bg))
         return b
 
+    topbar = tk.Frame(root, bg=DARK, height=px(56))
+    topbar.pack(side="top", fill="x")
+    topbar.pack_propagate(False)
+    brand = tk.Frame(topbar, bg=DARK)
+    brand.pack(side="left", padx=px(18))
+    tk.Label(brand, text="N", font=(FONT, 14, "bold"), fg="white", bg=ACCENT).pack(
+        side="left", ipadx=px(9), ipady=px(1))
+    tk.Label(brand, text="NOVA LAUNCHER", font=(FONT, 11, "bold"), fg=FG, bg=DARK).pack(
+        side="left", padx=(px(10), 0))
+    tk.Label(brand, text=f"v{APP_VERSION}", font=(FONT, 8), fg=MUTED, bg=DARK).pack(
+        side="left", padx=(px(8), 0), pady=(px(3), 0))
+    back_btn = flat_btn(topbar, "←  Inicio", lambda: show_page("play"), bg=CARD, hover=CARD2, size=10)
+    right = tk.Frame(topbar, bg=DARK)
+    right.pack(side="right", padx=px(12))
+    for txt, fn in (("▣ Datos", lambda: open_folder(ROOT)), ("≡ Consola", lambda: show_page("console")),
+                    ("⚙ Ajustes", lambda: show_page("settings"))):
+        flat_btn(right, txt, fn, bg=DARK, hover=CARD2, size=10).pack(
+            side="right", padx=px(2), ipadx=px(10), ipady=px(6))
+    chip = tk.Button(right, textvariable=chip_var, font=(FONT, 10, "bold"), bg=ACCENT, fg="white",
+                     activebackground="#7ba3ff", activeforeground="white", relief="flat", bd=0,
+                     cursor="hand2", command=lambda: show_page("settings"))
+    chip.pack(side="right", padx=(px(10), px(8)), ipadx=px(14), ipady=px(5))
+    logout_btn = flat_btn(right, "Salir", lambda: logout(), bg=DARK, hover=CARD2, size=10)
+    logout_btn.pack(side="right", padx=px(2), ipadx=px(10), ipady=px(6))
+    admin_btn = flat_btn(right, "★ Admin", lambda: show_page("admin"), bg="#3a2230", hover="#55304a",
+                         fg="#ff9fb4", size=10)
+
+    content = tk.Frame(root, bg=BG)
+    content.pack(fill="both", expand=True)
+
     def card(parent, **kw):
         return tk.Frame(parent, bg=CARD, highlightthickness=1, highlightbackground=LINE, **kw)
 
@@ -1159,84 +1363,13 @@ def run_gui():
     def page_title(parent, text):
         return tk.Label(parent, text=text, font=(FONT, 22, "bold"), fg=FG, bg=BG)
 
-    # ================================================================== barra dorada
-    header = tk.Canvas(root, height=px(32), bg=BG, highlightthickness=0, bd=0)
-    header.pack(side="top", fill="x")
-
-    def draw_header(_=None):
-        w, h = header.winfo_width(), header.winfo_height()
-        if w < 20:
-            return
-        header.delete("all")
-        for x in range(0, w, 3):
-            t = x / w
-            col = blend("#c98f10", "#7a5208", t * 0.6) if t < 0.5 else blend("#a87a0e", "#14110a", (t - 0.5) * 1.5)
-            header.create_rectangle(x, 0, x + 3, h, fill=col, outline="")
-        header.create_text(px(12), h / 2, anchor="w", text=f"{APP_NAME} {APP_VERSION} Premium Edition",
-                           fill="white", font=(FONT, 10, "bold"))
-
-    header.bind("<Configure>", draw_header)
-
-    # ================================================================== barra flotante inferior
-    dockf = tk.Frame(root, bg=DOCK)
-    dockf.pack(side="bottom", fill="x")
-    bar = ttk.Progressbar(dockf, mode="determinate", style="Nova.Horizontal.TProgressbar")
-    bar.pack(fill="x")
-    tk.Label(dockf, textvariable=status_var, font=(FONT, 9), fg=MUTED, bg=DOCK).pack(pady=(px(6), 0))
-    pill = tk.Canvas(dockf, height=px(62), bg=DOCK, highlightthickness=0, bd=0)
-    pill.pack(fill="x")
-
-    content = tk.Frame(root, bg=BG)
-    content.pack(side="top", fill="both", expand=True)
-    pages = {}
-
-    def show_page(name):
-        for f in pages.values():
-            f.pack_forget()
-        state["page"] = name
-        pages[name].pack(fill="both", expand=True)
-        if name == "mods":
-            mods_enter()
-
-    dock_items = [("⌂  Inicio", lambda: show_page("play")),
-                  ("✦  Mods", lambda: show_page("mods")),
-                  ("≡  Consola", lambda: show_page("console")),
-                  ("⚙  Ajustes", lambda: show_page("settings")),
-                  ("▣  Instancias", lambda: show_page("instances")),
-                  ("⬇  Descargar", lambda: open_instance_dialog(None))]
-    dock_btns = [RoundButton(pill, t, fn, ACCENT, ACCENT_H, PILL, font=(FONT, 10, "bold"),
-                             height=34, radius=10, width=len(t) * 7 + 34) for t, fn in dock_items]
-    play_btn = RoundButton(pill, "▶  Jugar", lambda: on_play(), GREEN, GREEN_H, PILL,
-                           font=(FONT, 10, "bold"), height=34, radius=10, width=130)
-    dock_btns.append(play_btn)
-
-    def draw_dock(_=None):
-        w = pill.winfo_width()
-        if w < 100:
-            return
-        pill.delete("all")
-        gap, ph, y0 = px(8), px(48), px(6)
-        widths = [px(int(b.winfo_reqwidth() / SC)) if False else int(float(b.cget("width")))
-                  for b in dock_btns]
-        total = sum(widths) + gap * (len(widths) + 1)
-        x = (w - total) // 2
-        round_rect(pill, x, y0, x + total, y0 + ph, px(16), fill=PILL, outline=LINE)
-        x += gap
-        for b, wd in zip(dock_btns, widths):
-            pill.create_window(x, y0 + ph // 2, window=b, anchor="w", width=wd, height=px(34))
-            x += wd + gap
-
-    pill.bind("<Configure>", draw_dock)
-
     # ================================================================== INICIO
-    scene = tk.Canvas(content, bg=BG, highlightthickness=0, bd=0)
-    pages["play"] = scene
-
-    news_box = ttk.Combobox(scene, textvariable=news_var, values=list(NEWS), state="readonly",
-                            font=(FONT, 9), width=18)
-    inst_box = ttk.Combobox(scene, textvariable=sel_var, state="readonly", font=(FONT, 11), width=24)
-    ver_btn = RoundButton(scene, "Ver instancias →", lambda: show_page("instances"), ACCENT, ACCENT_H,
-                          "#0d1328", font=(FONT, 9, "bold"), height=30, radius=9, width=140)
+    HC, HL = "#0f1424", "#26304f"
+    play = tk.Frame(content, bg=BG)
+    pages["play"] = play
+    scene = tk.Canvas(play, bg=BG, highlightthickness=0, bd=0)
+    scene.place(x=0, y=0, relwidth=1.0, relheight=1.0)
+    status_vals = {"mojang": None, "modrinth": None}
 
     def heights(w, seed, base, amp, step):
         r = random.Random(seed)
@@ -1247,162 +1380,168 @@ def run_gui():
             out.append(int((base + amp * v) // step * step))
         return out
 
-    def net_status(key):
-        v = state["net"][key]
-        if key == "mojang" and v is None and state["manifest"]:
-            v = True
-        if v is None:
-            return "Comprobando...", MUTED
-        return ("Operativo", OK) if v else ("Sin conexión", BAD)
+    def draw_night(cv):
+        w, h = cv.winfo_width(), cv.winfo_height()
+        if w < 60 or h < 60:
+            return
+        cv.delete("all")
+        for y in range(0, h, 3):
+            cv.create_line(0, y, w, y, fill=blend("#04050d", "#18275a", (y / h) ** 0.9), width=3)
+        rng = random.Random(21)
+        for _i in range(160):                      # vía láctea
+            t = rng.random()
+            x = w * (0.05 + 0.95 * t) + rng.gauss(0, w * 0.045)
+            y = h * (0.80 - 0.62 * t) + rng.gauss(0, h * 0.06)
+            z = px(rng.choice([1, 2, 2, 3]))
+            cv.create_rectangle(x, y, x + z, y + z, fill=blend("#18275a", "#9fb2ff", 0.25 + rng.random() * 0.5),
+                                   outline="")
+        for _i in range(230):                      # estrellas
+            x, y, z = rng.randrange(w), rng.randrange(int(h * 0.7)), px(rng.choice([1, 1, 2]))
+            cv.create_rectangle(x, y, x + z, y + z, fill=blend("#18275a", "#ffffff", 0.35 + rng.random() * 0.65),
+                                   outline="")
+        mx, my, mr = int(w * 0.80), int(h * 0.60), px(30)
+        for grow, col in ((2.0, "#141d45"), (1.45, "#1d2a5c"), (1.0, "#e9eefc")):
+            rr = int(mr * grow)
+            cv.create_rectangle(mx - rr, my - rr, mx + rr, my + rr, fill=col, outline="")
+        cv.create_rectangle(mx - mr // 3, my - mr // 2, mx + mr // 4, my - mr // 6, fill="#c3cbe6", outline="")
+        step = px(24)
+        for seed, base, amp, col in ((4, 0.80, 0.05, "#0d1534"), (9, 0.86, 0.04, "#080d22")):
+            hs = heights(w, seed, h * base, h * amp, step)
+            for i, hy in enumerate(hs):
+                cv.create_rectangle(i * step, hy, i * step + step, h, fill=col, outline="")
+                if seed == 9 and i % 8 == 3:
+                    cv.create_rectangle(i * step + step * 0.35, hy - step * 2, i * step + step * 0.65, hy,
+                                           fill="#05081a", outline="")
+                    cv.create_rectangle(i * step - step, hy - step * 4, i * step + step * 2, hy - step * 2,
+                                           fill="#060b1f", outline="")
+                    cv.create_rectangle(i * step, hy - step * 5, i * step + step, hy - step * 4,
+                                           fill="#060b1f", outline="")
 
     def draw_scene(_=None):
-        w, h = scene.winfo_width(), scene.winfo_height()
-        if w < 300 or h < 260:
-            return
-        scene.delete("all")
-        state["hits"] = []
+        draw_night(scene)
 
-        def txt(x, y, s, size, fill=FG, bold=False, anchor="w", width=None):
-            kw = {"width": width} if width else {}
-            return scene.create_text(x, y, anchor=anchor, text=s, fill=fill,
-                                     font=(FONT, size, "bold" if bold else "normal"), **kw)
-
-        # --- cielo nocturno y vía láctea
-        sky0, sky1 = "#04060e", "#101d3f"
-        for y in range(0, h, 4):
-            scene.create_line(0, y, w, y, fill=blend(sky0, sky1, y / h), width=4)
-        rng = random.Random(21)
-        ax, ay, bx, by = w * 0.80, -h * 0.05, w * 0.40, h * 0.85
-        for _i in range(520):
-            t = rng.random()
-            x = ax + (bx - ax) * t + rng.gauss(0, w * 0.055)
-            y = ay + (by - ay) * t + rng.gauss(0, h * 0.05)
-            z = px(rng.choice([1, 1, 2]))
-            scene.create_rectangle(x, y, x + z, y + z,
-                                   fill=blend(sky1, "#9db2e6", 0.15 + rng.random() * 0.5), outline="")
-        for _i in range(130):
-            x, y, z = rng.randrange(w), rng.randrange(int(h * 0.7)), px(rng.choice([1, 2]))
-            scene.create_rectangle(x, y, x + z, y + z,
-                                   fill=blend(sky0, "#ffffff", 0.4 + rng.random() * 0.6), outline="")
-        # --- terreno nevado en bloques
-        step = px(22)
-        for seed, base, amp, col in ((5, 0.74, 0.05, "#0e1730"), (9, 0.80, 0.04, "#14213f")):
-            for i, hy in enumerate(heights(w, seed, h * base, h * amp, step)):
-                scene.create_rectangle(i * step, hy, i * step + step, h, fill=col, outline="")
-        rr = random.Random(7)
-        for i, hy in enumerate(heights(w, 17, h * 0.88, h * 0.03, step)):
-            x0 = i * step
-            scene.create_rectangle(x0, hy, x0 + step, hy + step // 2,
-                                   fill=blend("#8fa3c9", "#c9d6ee", rr.random() * 0.6), outline="")
-            scene.create_rectangle(x0, hy + step // 2, x0 + step, h,
-                                   fill=blend("#101a30", "#18233f", rr.random()), outline="")
-
-        # --- geometría
-        m = px(28)
-        lw = int(w * 0.60)
-        x0 = m + lw + px(28)
-        rw = max(px(240), w - m - x0)
-
-        # --- columna izquierda: novedades
-        txt(m + 2, px(42) + 2, "Últimas novedades de Nova", 22, "#02030a", True)
-        txt(m, px(42), "Últimas novedades de Nova", 22, "white", True)
-        scene.create_window(m + lw, px(42), window=news_box, anchor="e", width=px(170))
-        n_title, n_body, n_author = NEWS.get(news_var.get(), list(NEWS.values())[0])
-        y1, y2 = px(78), int(h * 0.64)
-        round_rect(scene, m, y1, m + lw, y2, px(14), fill=CARDH, outline=LINE)
-        txt(m + px(18), y1 + px(30), n_title, 17, "#c9ced9", True)
-        txt(m + lw - px(18), y1 + px(26), time.strftime("%d").lstrip("0"), 15, "#c9ced9", True, "e")
-        txt(m + lw - px(18), y1 + px(46), MESES[int(time.strftime("%m")) - 1], 9, "#aeb5c6", True, "e")
-        txt(m + px(18), y1 + px(62), n_body, 11, "#aeb5c6", False, "nw", lw - px(36))
-        iy = y1 + px(112)
-        ih = max(px(50), y2 - iy - px(40))
-        iw = min(px(300), lw - px(36))
-        round_rect(scene, m + px(18), iy, m + px(18) + iw, iy + ih, px(10), fill="#080d1c", outline=LINE)
-        s = min(ih - px(24), px(80))
-        cx, cy = m + px(18) + iw // 2, iy + ih // 2
-        scene.create_rectangle(cx - s - px(34), cy - s // 2, cx - px(34), cy + s // 2,
-                               outline=GOLD, width=px(5), fill="")
-        txt(cx - s // 2 - px(34), cy, "N", max(14, int(s / SC * 0.45)), GOLD, True, "center")
-        txt(cx, cy, "×", 22, "#9aa3b8", True, "center")
-        c0 = cx + px(34)
-        scene.create_rectangle(c0, cy - s // 2, c0 + s, cy - s // 2 + s // 3, fill="#4fb552", outline="")
-        scene.create_rectangle(c0, cy - s // 2 + s // 3, c0 + s, cy + s // 2, fill="#6d4b31", outline="")
-        txt(m + lw - px(18), y2 - px(18), f"⚒ {n_author}", 9, "#9aa3b8", True, "e")
-
-        # --- jugador activo
-        ty = y2 + px(44)
-        txt(m + 2, ty + 2, "Jugador activo", 20, "#02030a", True)
-        txt(m, ty, "Jugador activo", 20, "white", True)
-        scene.create_window(m + lw, ty, window=ver_btn, anchor="e", width=px(140), height=px(30))
-        name = user_var.get().strip() or "Jugador"
-        inst = cur()
-        ry = ty + px(24)
-        rh = px(56)
-        round_rect(scene, m, ry, m + px(320), ry + rh, px(12), fill=CARDH, outline=LINE)
-        scene.create_rectangle(m + px(10), ry + px(10), m + px(10) + px(36), ry + px(46),
-                               fill=accent_for(name), outline="")
-        txt(m + px(28), ry + px(28), name[:1].upper(), 14, "white", True, "center")
-        txt(m + px(58), ry + px(19), name[:20], 11, FG, True)
-        stt = f"Jugando {state['playing']}" if state["playing"] else "En el menú de inicio"
-        txt(m + px(58), ry + px(39), stt, 9, "#9aa3b8")
-        state["hits"].append((m, ry, m + px(320), ry + rh, "settings"))
-        txt(m + px(340), ry + px(10), "INSTANCIA", 8, "#9aa3b8", True)
-        scene.create_window(m + px(340), ry + px(38), window=inst_box, anchor="w", width=px(240))
-        if not inst:
-            txt(m, ry + rh + px(14), "Creá una instancia para empezar (botón Descargar).", 9, "#ffe1c9")
-        else:
-            txt(m, ry + rh + px(14), describe(inst), 9, "#9aa3b8")
-
-        # --- columna derecha: estado
-        txt(x0 + 2, px(46) + 2, "Estado de Nova", 22, "#02030a", True)
-        txt(x0, px(46), "Estado de Nova", 22, "white", True)
-
-        def mini(x, y, cw, chh, title, sub, subcol, glyph="N", bold_title=True, tsize=11):
-            round_rect(scene, x, y, x + cw, y + chh, px(12), fill=CARDH, outline=LINE)
-            if glyph:
-                scene.create_rectangle(x + px(12), y + (chh - px(26)) // 2, x + px(38),
-                                       y + (chh + px(26)) // 2, outline=GOLD, width=2, fill="")
-                txt(x + px(25), y + chh // 2, glyph, 11, GOLD, True, "center")
-            tx = x + (px(50) if glyph else px(14))
-            if sub:
-                txt(tx, y + chh * 0.36, title, tsize, "#c9ced9", bold_title)
-                txt(tx, y + chh * 0.72, sub, 8, subcol)
-            else:
-                txt(tx, y + chh // 2, title, tsize, "#c9ced9", bold_title)
-
-        cw2 = (rw - px(10)) // 2
-        st, sc_ = net_status("mojang")
-        mini(x0, px(78), cw2, px(56), "Mojang", st, sc_)
-        st, sc_ = net_status("modrinth")
-        mini(x0 + cw2 + px(10), px(78), cw2, px(56), "Modrinth", st, sc_)
-        n = len(instances())
-        total = sum(int(i.get("playtime", 0)) for i in instances())
-        mini(x0, px(146), rw, px(50), f"{n} instancia{'s' if n != 1 else ''}  ·  {fmt_time(total)}",
-             "", MUTED, "▣", True, 12)
-        state["hits"].append((x0, px(146), x0 + rw, px(196), "instances"))
-        if state["playing"]:
-            mini(x0, px(208), rw, px(66), "♪ Jugando ahora", state["playing"], "#9aa3b8", "", True, 12)
-        else:
-            mini(x0, px(208), rw, px(66), "♪ Jugando ahora", "Nada en ejecución", "#9aa3b8", "", True, 12)
-
-    news_box.bind("<<ComboboxSelected>>", lambda e: draw_scene())
+    draw_hero = draw_scene
     scene.bind("<Configure>", draw_scene)
-    scene.bind("<Button-1>", lambda e: next(
-        (show_page(p) for (a, b, c, d, p) in state["hits"] if a <= e.x <= c and b <= e.y <= d), None))
-    user_var.trace_add("write", lambda *a: draw_scene())
+
+    def hub_card(**place):
+        f = tk.Frame(play, bg=HC, highlightthickness=1, highlightbackground=HL)
+        f.place(**place)
+        return f
+
+    def hub_title(parent, text):
+        tk.Label(parent, text=text, font=(FONT, 13, "bold"), fg=FG, bg=HC, anchor="w").pack(
+            fill="x", padx=px(20), pady=(px(14), px(8)))
+
+    news = hub_card(x=px(30), y=px(20), relwidth=0.60, height=px(250))
+    hub_title(news, "Últimas novedades de Minecraft")
+    news_body = tk.Frame(news, bg=HC)
+    news_body.pack(fill="both", expand=True, padx=px(20), pady=(0, px(10)))
+
+    stat = hub_card(relx=0.64, y=px(20), relwidth=0.33, height=px(250))
+    hub_title(stat, "Estado de NovaLauncher")
+    stat_body = tk.Frame(stat, bg=HC)
+    stat_body.pack(fill="both", expand=True, padx=px(20), pady=(0, px(10)))
+
+    mine = hub_card(x=px(30), rely=1.0, y=-px(122), anchor="sw", relwidth=0.60, height=px(150))
+    hub_title(mine, "Tus instancias")
+    mine_body = tk.Frame(mine, bg=HC)
+    mine_body.pack(fill="both", expand=True, padx=px(20), pady=(0, px(8)))
+
+    def create_vanilla(vid):
+        ni = new_instance(unique_name(f"Minecraft {vid}", instances()), vid, ram_mb=min(4096, max_ram))
+        instances().append(ni)
+        cfg["last_instance"] = ni["id"]
+        save_all()
+        refresh_all()
+
+    def dot_row(parent, label, value, color):
+        r = tk.Frame(parent, bg=HC)
+        r.pack(fill="x", pady=px(3))
+        tk.Label(r, text="●", font=(FONT, 9), fg=color, bg=HC).pack(side="left")
+        tk.Label(r, text=label, font=(FONT, 10), fg=FG, bg=HC).pack(side="left", padx=(px(8), 0))
+        tk.Label(r, text=value, font=(FONT, 10, "bold"), fg=color, bg=HC).pack(side="right")
+
+    def refresh_home():
+        for w_ in news_body.winfo_children():
+            w_.destroy()
+        m = state["manifest"]
+        if not m:
+            tk.Label(news_body, text="Cargando versiones...", font=(FONT, 10), fg=MUTED, bg=HC).pack(pady=px(24))
+        else:
+            for v in m["versions"][:4]:
+                row = tk.Frame(news_body, bg=HC)
+                row.pack(fill="x", pady=px(3))
+                snap = v["type"] != "release"
+                tk.Label(row, text="SNAPSHOT" if snap else "RELEASE", font=(FONT, 8, "bold"), fg="white",
+                         bg="#c08a2c" if snap else GREEN, width=10).pack(side="left", ipady=px(3))
+                col = tk.Frame(row, bg=HC)
+                col.pack(side="left", fill="x", expand=True, padx=px(12))
+                tk.Label(col, text=f"Minecraft {v['id']}", font=(FONT, 11, "bold"), fg=FG, bg=HC,
+                         anchor="w").pack(fill="x")
+                tk.Label(col, text=(v.get("releaseTime") or "")[:10], font=(FONT, 8), fg=MUTED, bg=HC,
+                         anchor="w").pack(fill="x")
+                flat_btn(row, "Crear instancia", lambda vid=v["id"]: create_vanilla(vid), bg=CARD2,
+                         hover=LINE).pack(side="right", ipadx=px(10), ipady=px(4))
+        for w_ in stat_body.winfo_children():
+            w_.destroy()
+        names = {None: ("Comprobando...", MUTED), True: ("En línea", GREEN), False: ("Sin conexión", "#ff6b81")}
+        dot_row(stat_body, "Mojang · versiones", *names[status_vals["mojang"]])
+        dot_row(stat_body, "Modrinth · tienda", *names[status_vals["modrinth"]])
+        has_key = bool((cfg.get("ai_key") or "").strip())
+        dot_row(stat_body, "Asistente IA", "Listo" if has_key else "Falta la clave", GREEN if has_key else "#e0a030")
+        dot_row(stat_body, "Instancias", str(len(instances())), FG)
+        dot_row(stat_body, "Tiempo jugado", fmt_time(sum(int(i.get("playtime", 0)) for i in instances())), FG)
+        dot_row(stat_body, "RAM del PC", f"{total_ram_mb() / 1024:.0f} GB", FG)
+        for w_ in mine_body.winfo_children():
+            w_.destroy()
+        if not instances():
+            tk.Label(mine_body, text="Todavía no tenés instancias. Creá una desde las novedades.",
+                     font=(FONT, 10), fg=MUTED, bg=HC).pack(pady=px(14))
+        for inst in instances()[:3]:
+            row = tk.Frame(mine_body, bg=HC)
+            row.pack(fill="x", pady=px(2))
+            tk.Frame(row, bg=accent_for(inst["id"]), width=px(5)).pack(side="left", fill="y", padx=(0, px(10)))
+            tk.Label(row, text=inst["name"], font=(FONT, 10, "bold"), fg=FG, bg=HC, anchor="w").pack(side="left")
+            tk.Label(row, text="   " + describe(inst), font=(FONT, 9), fg=MUTED, bg=HC).pack(side="left")
+            flat_btn(row, "Jugar", lambda i=inst["id"]: play_instance(i), bg=GREEN, hover=GREEN_H, fg="white").pack(
+                side="right", ipadx=px(12), ipady=px(3))
+
+    def open_store(ptype):
+        mods_state["ptype"] = ptype
+        mods_state["for"] = None
+        show_page("mods")
+
+    bottom = tk.Frame(play, bg=DARK)
+    bottom.place(x=0, rely=1.0, relwidth=1.0, anchor="sw", height=px(108))
+    prog = tk.Frame(bottom, bg=DARK)
+    prog.pack(fill="x", padx=px(24), pady=(px(10), 0))
+    tk.Label(prog, textvariable=status_var, font=(FONT, 9), fg=MUTED, bg=DARK, anchor="w", width=34).pack(side="left")
+    bar = ttk.Progressbar(prog, mode="determinate", style="Nova.Horizontal.TProgressbar")
+    bar.pack(side="left", fill="x", expand=True)
+    ctrl = tk.Frame(bottom, bg=DARK)
+    ctrl.pack(fill="x", padx=px(24), pady=(px(8), 0))
+    inst_box = ttk.Combobox(ctrl, textvariable=sel_var, state="readonly", font=(FONT, 11), width=20)
+    inst_box.pack(side="left", ipady=px(5))
+    for txt, fn in (("Mods", lambda: open_store("mod")), ("Texturas", lambda: open_store("resourcepack")),
+                    ("Instancias", lambda: show_page("instances")), ("✧ Asistente IA", lambda: show_page("ai"))):
+        flat_btn(ctrl, txt, fn, bg=CARD2, hover=LINE, size=10).pack(
+            side="left", padx=(px(8), 0), ipadx=px(12), ipady=px(9))
+    play_btn = RoundButton(ctrl, "JUGAR", lambda: on_play(), GREEN, GREEN_H, DARK, height=50)
+    play_btn.configure(width=px(230))
+    play_btn.pack(side="right")
 
     # ================================================================== INSTANCIAS
     inst_page = tk.Frame(content, bg=BG)
     pages["instances"] = inst_page
     ih = tk.Frame(inst_page, bg=BG)
-    ih.pack(fill="x", padx=px(36), pady=(px(22), px(10)))
+    ih.pack(fill="x", padx=px(36), pady=(px(28), px(14)))
     page_title(ih, "Instancias").pack(side="left")
-    RoundButton(ih, "＋  Nueva instancia", lambda: open_instance_dialog(None), ACCENT, ACCENT_H, BG,
+    RoundButton(ih, "＋  Nueva instancia", lambda: open_instance_dialog(None), ACCENT, "#7ba3ff", BG,
                 font=(FONT, 11, "bold"), height=42, radius=12).pack(side="right", ipadx=px(26))
     tk.Label(inst_page, text="Cada instancia tiene su propia versión, mods, mundos y opciones.",
              font=(FONT, 10), fg=MUTED, bg=BG).pack(anchor="w", padx=px(38), pady=(0, px(10)))
     ilist = ScrollFrame(inst_page, BG)
-    ilist.pack(fill="both", expand=True, padx=(px(36), px(20)), pady=(0, px(10)))
+    ilist.pack(fill="both", expand=True, padx=(px(36), px(20)), pady=(0, px(20)))
 
     def build_instances():
         for w in ilist.inner.winfo_children():
@@ -1427,11 +1566,11 @@ def run_gui():
             iid = inst["id"]
             flat_btn(right, "Jugar", lambda i=iid: play_instance(i), bg=GREEN, hover=GREEN_H,
                      fg="white", size=10).pack(side="left", padx=px(3), ipadx=px(14), ipady=px(6))
-            for txt_, fn in (("Editar", lambda i=iid: on_inst(i, open_instance_dialog)),
-                             ("Mods", lambda i=iid: open_mods_for(i)),
-                             ("Duplicar", lambda i=iid: on_inst(i, duplicate_instance)),
-                             ("Carpeta", lambda i=iid: on_inst(i, lambda x: open_folder(game_dir(x))))):
-                flat_btn(right, txt_, fn, bg=CARD2, hover=LINE).pack(
+            for txt, fn in (("Editar", lambda i=iid: on_inst(i, open_instance_dialog)),
+                            ("Mods", lambda i=iid: open_mods_for(i)),
+                            ("Duplicar", lambda i=iid: on_inst(i, duplicate_instance)),
+                            ("Carpeta", lambda i=iid: on_inst(i, lambda x: open_folder(game_dir(x))))):
+                flat_btn(right, txt, fn, bg=CARD2, hover=LINE).pack(
                     side="left", padx=px(3), ipadx=px(10), ipady=px(6))
             flat_btn(right, "Eliminar", lambda i=iid: delete_instance(i), bg=CARD2, hover=RED,
                      fg="#ff8a9b").pack(side="left", padx=px(3), ipadx=px(10), ipady=px(6))
@@ -1452,6 +1591,7 @@ def run_gui():
                           "No se puede deshacer."):
             return
         shutil.rmtree(game_dir(inst), ignore_errors=True)
+        audit_event("instancia eliminada", inst["name"])
         cfg["instances"] = [i for i in instances() if i["id"] != iid]
         if cfg.get("last_instance") == iid:
             cfg["last_instance"] = instances()[0]["id"] if instances() else ""
@@ -1474,12 +1614,12 @@ def run_gui():
         save_all()
         refresh_all()
 
-    # ================================================================== TIENDA (mods)
+    # ================================================================== TIENDA
     mods_page = tk.Frame(content, bg=BG)
     pages["mods"] = mods_page
     mt = tk.Frame(mods_page, bg=BG)
-    mt.pack(fill="x", padx=px(36), pady=(px(20), px(4)))
-    page_title(mt, "Mods").pack(side="left")
+    mt.pack(fill="x", padx=px(36), pady=(px(26), px(4)))
+    page_title(mt, "Tienda").pack(side="left")
     mods_target = tk.StringVar(value="")
     tk.Label(mt, textvariable=mods_target, font=(FONT, 10), fg=MUTED, bg=BG).pack(
         side="left", padx=px(16), pady=(px(12), 0))
@@ -1515,14 +1655,14 @@ def run_gui():
                   relief="flat", highlightthickness=1, highlightbackground=LINE, highlightcolor=ACCENT)
     mq.pack(side="left", fill="x", expand=True, ipady=px(7))
     mq.bind("<Return>", lambda e: mods_search())
-    flat_btn(mrow, "Buscar", lambda: mods_search(), bg=ACCENT, hover=ACCENT_H, fg="white", size=10).pack(
+    flat_btn(mrow, "Buscar", lambda: mods_search(), bg=ACCENT, hover="#7ba3ff", fg="white", size=10).pack(
         side="left", padx=(px(8), 0), ipadx=px(20), ipady=px(7))
     mods_status = tk.StringVar(value="")
     mods_status_lbl = tk.Label(mods_page, textvariable=mods_status, font=(FONT, 10), fg=MUTED, bg=BG,
                                anchor="w", justify="left", wraplength=px(820))
     mods_status_lbl.pack(fill="x", padx=px(38), pady=(0, px(6)))
     mods_list = ScrollFrame(mods_page, BG)
-    mods_list.pack(fill="both", expand=True, padx=(px(36), px(20)), pady=(0, px(10)))
+    mods_list.pack(fill="both", expand=True, padx=(px(36), px(20)), pady=(0, px(20)))
     mods_list.inner.columnconfigure(0, weight=1, uniform="g")
     mods_list.inner.columnconfigure(1, weight=1, uniform="g")
 
@@ -1605,7 +1745,7 @@ def run_gui():
         for k in ("fabric", "quilt", "forge", "neoforge"):
             main = k == "fabric"
             flat_btn(r, LOADER_NAMES[k], lambda kk=k: quick_create(kk), bg=ACCENT if main else CARD2,
-                     hover=ACCENT_H if main else LINE, fg="white" if main else FG, size=10).pack(
+                     hover="#7ba3ff" if main else LINE, fg="white" if main else FG, size=10).pack(
                 side="left", padx=(0, px(8)), ipadx=px(18), ipady=px(8))
         tk.Label(c, text="Las pestañas Texturas y Shaders sí funcionan en esta instancia.",
                  font=(FONT, 9), fg=MUTED, bg=CARD).pack(anchor="w", padx=px(22), pady=(0, px(16)))
@@ -1719,19 +1859,697 @@ def run_gui():
                 flat_btn(c, "Activar" if off else "Desactivar", toggle, bg=CARD2, hover=LINE).pack(
                     side="right", padx=px(4), ipadx=px(10), ipady=px(5))
 
+    # ================================================================== ASISTENTE IA
+    ai_page = tk.Frame(content, bg=BG)
+    pages["ai"] = ai_page
+    ai_state = {"history": [], "busy": False}
+    ah = tk.Frame(ai_page, bg=BG)
+    ah.pack(fill="x", padx=px(36), pady=(px(26), px(4)))
+    page_title(ah, "Asistente IA").pack(side="left")
+    model_v = tk.StringVar(value=cfg.get("ai_model") or AI_MODELS[0])
+    mbox = ttk.Combobox(ah, textvariable=model_v, values=AI_MODELS, font=(FONT, 10), width=26)
+    mbox.pack(side="right", ipady=px(2))
+    tk.Label(ah, text="Modelo:", font=(FONT, 9), fg=MUTED, bg=BG).pack(side="right", padx=(0, px(8)))
+
+    def on_model(_=None):
+        cfg["ai_model"] = model_v.get().strip() or AI_MODELS[0]
+        save_config(cfg)
+
+    mbox.bind("<<ComboboxSelected>>", on_model)
+    mbox.bind("<FocusOut>", on_model)
+    tk.Label(ai_page, text="Preguntale por mods, crashes, RAM o versiones. Conoce tu instancia actual.",
+             font=(FONT, 10), fg=MUTED, bg=BG, anchor="w").pack(fill="x", padx=px(38), pady=(0, px(10)))
+
+    setup = card(ai_page)
+    tk.Label(setup, text="Conectá tu clave de API de Anthropic", font=(FONT, 14, "bold"), fg=FG, bg=CARD).pack(
+        anchor="w", padx=px(22), pady=(px(18), px(4)))
+    tk.Label(setup, text="La IA funciona con tu propia clave: se saca en console.anthropic.com (API Keys). "
+                         "Las consultas se cobran a tu cuenta de Anthropic (son centavos). La clave se guarda "
+                         "solo en tu PC, dentro de la carpeta de datos del launcher; nunca la compartas ni la "
+                         "subas a GitHub.", font=(FONT, 10), fg=MUTED, bg=CARD, wraplength=px(720),
+             justify="left").pack(anchor="w", padx=px(22))
+    key_v = tk.StringVar()
+    krow = tk.Frame(setup, bg=CARD)
+    krow.pack(fill="x", padx=px(22), pady=px(18))
+    tk.Entry(krow, textvariable=key_v, show="•", font=(FONT, 11), bg=CARD2, fg=FG, insertbackground=FG,
+             relief="flat", highlightthickness=1, highlightbackground=LINE, highlightcolor=ACCENT).pack(
+        side="left", fill="x", expand=True, ipady=px(7))
+
+    def save_key():
+        k = key_v.get().strip()
+        if not k:
+            return
+        cfg["ai_key"] = k
+        save_config(cfg)
+        key_v.set("")
+        ai_enter()
+        refresh_home()
+
+    flat_btn(krow, "Guardar clave", save_key, bg=ACCENT, hover="#7ba3ff", fg="white", size=10).pack(
+        side="left", padx=(px(8), 0), ipadx=px(16), ipady=px(7))
+
+    chat = tk.Frame(ai_page, bg=BG)
+    chat_text = tk.Text(chat, bg=CARD, fg="#d5d9e6", font=(FONT, 10), relief="flat", wrap="word",
+                        state="disabled", bd=0, padx=px(14), pady=px(12), highlightthickness=1,
+                        highlightbackground=LINE, spacing3=px(6))
+    chat_sb = tk.Scrollbar(chat, command=chat_text.yview)
+    chat_text.configure(yscrollcommand=chat_sb.set)
+    chat_text.tag_configure("user", foreground="#9fc0ff", font=(FONT, 10, "bold"))
+    chat_text.tag_configure("bot", foreground="#e9ecf4")
+    chat_text.tag_configure("err", foreground="#ff8a9b")
+    chat_text.tag_configure("note", foreground=MUTED, font=(FONT, 9, "italic"))
+    chips = tk.Frame(chat, bg=BG)
+    chips.pack(side="bottom", fill="x", pady=(px(6), 0))
+    irow = tk.Frame(chat, bg=BG)
+    irow.pack(side="bottom", fill="x", pady=(px(8), 0))
+    ai_in_v = tk.StringVar()
+    ai_in = tk.Entry(irow, textvariable=ai_in_v, font=(FONT, 11), bg=CARD2, fg=FG, insertbackground=FG,
+                     relief="flat", highlightthickness=1, highlightbackground=LINE, highlightcolor=ACCENT)
+    ai_in.pack(side="left", fill="x", expand=True, ipady=px(8))
+    chat_sb.pack(side="right", fill="y")
+    chat_text.pack(side="top", fill="both", expand=True)
+
+    def ai_append(role, text):
+        chat_text.config(state="normal")
+        label = {"user": "Vos\n", "bot": "Asistente\n", "err": "Error\n", "note": ""}[role]
+        if label:
+            chat_text.insert("end", label, "user" if role == "user" else role)
+        chat_text.insert("end", text + "\n\n", role if role != "user" else "bot")
+        chat_text.see("end")
+        chat_text.config(state="disabled")
+
+    def friendly_ai_error(e):
+        t = str(e)
+        if t.startswith("401"):
+            return "La clave de API no es válida. Tocá “Cambiar clave” y pegala de nuevo."
+        if t.startswith("404"):
+            return "Ese modelo no existe en tu cuenta. Elegí otro en el selector de arriba."
+        if t.startswith("429") or "credit" in t.lower():
+            return "Demasiadas consultas o te quedaste sin saldo en tu cuenta de Anthropic. " + t
+        return t
+
+    def ai_send(text, with_log=False):
+        text = (text or "").strip()
+        if not text or ai_state["busy"]:
+            return
+        key = (cfg.get("ai_key") or "").strip()
+        if not key:
+            ai_enter()
+            return
+        ai_append("user", text)
+        body = text
+        if with_log:
+            tail = "\n".join(log_text.get("1.0", "end").splitlines()[-150:])[-12000:]
+            body += "\n\n--- CONSOLA DEL LAUNCHER (últimas líneas) ---\n" + tail
+        ai_state["history"].append({"role": "user", "content": body})
+        ai_state["busy"] = True
+        status_var.set("El asistente está pensando...")
+        inst = cur()
+        system = ai_system_prompt(inst, installed_mod_names(inst))
+        model = (cfg.get("ai_model") or AI_MODELS[0]).strip()
+        hist = list(ai_state["history"][-16:])
+        while hist and hist[0]["role"] != "user":
+            hist.pop(0)
+
+        def job():
+            try:
+                res = ai_chat(key, model, system, hist)
+            except Exception as e:
+                res = e
+            msgs.put(("ai", res))
+        threading.Thread(target=job, daemon=True).start()
+
+    def ai_done(res):
+        ai_state["busy"] = False
+        status_var.set("Listo")
+        if isinstance(res, Exception):
+            if ai_state["history"] and ai_state["history"][-1]["role"] == "user":
+                ai_state["history"].pop()
+            ai_append("err", friendly_ai_error(res))
+        else:
+            ai_state["history"].append({"role": "assistant", "content": res})
+            ai_append("bot", clean_md(res))
+
+    def ai_submit(_=None):
+        t = ai_in_v.get()
+        ai_in_v.set("")
+        ai_send(t)
+
+    ai_in.bind("<Return>", ai_submit)
+    flat_btn(irow, "Enviar", ai_submit, bg=ACCENT, hover="#7ba3ff", fg="white", size=10).pack(
+        side="left", padx=(px(8), 0), ipadx=px(20), ipady=px(8))
+
+    def ai_analyze_log():
+        show_page("ai")
+        ai_send("Mi juego falló o se cerró de forma rara. Analizá la consola y decime la causa más "
+                "probable y cómo arreglarla.", with_log=True)
+
+    for txt, q, lg in (("Recomendame mods de rendimiento", "Recomendame mods de rendimiento para mi instancia "
+                        "actual (que existan para esta versión y cargador).", False),
+                       ("Analizar la consola", None, True),
+                       ("¿Cuánta RAM le doy?", "¿Cuánta RAM me conviene asignarle a esta instancia?", False),
+                       ("Fabric vs Forge", "Explicame en corto la diferencia entre Fabric, Forge y NeoForge "
+                        "y cuál me conviene.", False)):
+        flat_btn(chips, txt, (ai_analyze_log if q is None else (lambda qq=q: ai_send(qq))),
+                 bg=CARD, hover=CARD2, size=9).pack(side="left", padx=(0, px(6)), ipadx=px(10), ipady=px(6))
+    flat_btn(chips, "Cambiar clave", lambda: (cfg.update(ai_key=""), save_config(cfg), ai_enter(), refresh_home()),
+             bg=BG, hover=CARD, fg=MUTED).pack(side="right", ipadx=px(8), ipady=px(6))
+
+    def ai_enter():
+        if (cfg.get("ai_key") or "").strip():
+            setup.pack_forget()
+            chat.pack(fill="both", expand=True, padx=px(36), pady=(0, px(24)))
+            if not ai_state["history"] and not chat_text.get("1.0", "end").strip():
+                ai_append("note", "Hola, soy tu asistente. Puedo recomendarte mods, explicarte errores de la "
+                                  "consola o ayudarte a elegir RAM y versión. Usá los botones o escribime.")
+        else:
+            chat.pack_forget()
+            setup.pack(fill="x", padx=px(36), pady=(0, px(10)))
+
+    # ================================================================== LOGIN
+    login = tk.Frame(content, bg=BG)
+    pages["login"] = login
+    lbg = tk.Canvas(login, bg=BG, highlightthickness=0, bd=0)
+    lbg.place(x=0, y=0, relwidth=1.0, relheight=1.0)
+    lbg.bind("<Configure>", lambda e: draw_night(lbg))
+    lcard = tk.Frame(login, bg=HC, highlightthickness=1, highlightbackground=HL)
+    lcard.place(relx=0.5, rely=0.5, anchor="center", width=px(440))
+    tk.Label(lcard, text="N", font=(FONT, 26, "bold"), fg="white", bg=ACCENT).pack(
+        pady=(px(28), px(8)), ipadx=px(16), ipady=px(4))
+    login_title = tk.StringVar(value="Iniciar sesión")
+    login_sub = tk.StringVar(value="")
+    tk.Label(lcard, textvariable=login_title, font=(FONT, 16, "bold"), fg=FG, bg=HC).pack()
+    tk.Label(lcard, textvariable=login_sub, font=(FONT, 9), fg=MUTED, bg=HC, wraplength=px(360),
+             justify="center").pack(pady=(px(2), px(10)))
+    lu, lp, lp2 = tk.StringVar(), tk.StringVar(), tk.StringVar()
+    remember_v = tk.BooleanVar(value=False)
+    login_state = {"mode": "login", "fails": 0, "until": 0.0}
+
+    def lentry(parent, label, var, show=""):
+        tk.Label(parent, text=label, font=(FONT, 8, "bold"), fg=MUTED, bg=HC, anchor="w").pack(
+            fill="x", padx=px(36), pady=(px(8), px(3)))
+        e = tk.Entry(parent, textvariable=var, show=show, font=(FONT, 12), bg=CARD2, fg=FG,
+                     insertbackground=FG, relief="flat", highlightthickness=1, highlightbackground=LINE,
+                     highlightcolor=ACCENT)
+        e.pack(fill="x", padx=px(36), ipady=px(7))
+        e.bind("<Return>", lambda ev: login_submit())
+        return e
+
+    e_user = lentry(lcard, "USUARIO", lu)
+    e_pass = lentry(lcard, "CONTRASEÑA", lp, "•")
+    rep_frame = tk.Frame(lcard, bg=HC)
+    e_rep = lentry(rep_frame, "REPETIR CONTRASEÑA", lp2, "•")
+    rem_cb = tk.Checkbutton(lcard, text="Recordarme en este PC", variable=remember_v, fg=FG, bg=HC,
+                            selectcolor=CARD2, activebackground=HC, activeforeground=FG, font=(FONT, 9),
+                            bd=0, highlightthickness=0, anchor="w")
+    rem_cb.pack(fill="x", padx=px(34), pady=(px(10), 0))
+    login_err = tk.Label(lcard, text="", font=(FONT, 9), fg="#ff8a9b", bg=HC, wraplength=px(360), justify="left")
+    login_err.pack(fill="x", padx=px(36), pady=(px(6), 0))
+    submit_btn = RoundButton(lcard, "ENTRAR", lambda: login_submit(), ACCENT, "#7ba3ff", HC,
+                             font=(FONT, 12, "bold"), height=46, radius=12)
+    submit_btn.pack(fill="x", padx=px(36), pady=(px(10), px(6)))
+    switch_btn = flat_btn(lcard, "Crear una cuenta", lambda: login_switch(), bg=HC, hover=CARD2, fg=MUTED)
+    switch_btn.pack(pady=(0, px(22)), ipadx=px(12), ipady=px(4))
+
+    def login_set_mode(mode):
+        login_state["mode"] = mode
+        lp.set("")
+        lp2.set("")
+        login_err.config(text="")
+        if mode == "setup":
+            login_title.set("Creá tu cuenta de administrador")
+            login_sub.set("Es la primera vez. Esta cuenta será la dueña del launcher y tendrá el panel de "
+                          "administración.")
+            submit_btn.set_state("CREAR CUENTA", True)
+            switch_btn.pack_forget()
+        elif mode == "signup":
+            login_title.set("Crear cuenta")
+            login_sub.set("Vas a tener una cuenta de usuario. El administrador puede darte permisos.")
+            submit_btn.set_state("REGISTRARME", True)
+            switch_btn.config(text="Ya tengo cuenta")
+            switch_btn.pack(pady=(0, px(22)), ipadx=px(12), ipady=px(4))
+        else:
+            login_title.set("Iniciar sesión")
+            login_sub.set("Bienvenido de nuevo.")
+            submit_btn.set_state("ENTRAR", True)
+            if cfg.get("allow_signup", True):
+                switch_btn.config(text="Crear una cuenta")
+                switch_btn.pack(pady=(0, px(22)), ipadx=px(12), ipady=px(4))
+            else:
+                switch_btn.pack_forget()
+        if mode in ("setup", "signup"):
+            rep_frame.pack(fill="x", after=e_pass)
+        else:
+            rep_frame.pack_forget()
+
+    def login_switch():
+        login_set_mode("signup" if login_state["mode"] == "login" else "login")
+
+    def show_login():
+        topbar.pack_forget()
+        admin_btn.pack_forget()
+        chip_var.set("")
+        login_set_mode("setup" if not cfg["accounts"] else "login")
+        show_page("login")
+        e_user.focus_set()
+
+    def apply_session(acct, remember):
+        state["acct"] = acct
+        acct["last_login"] = time.strftime("%Y-%m-%d %H:%M")
+        cfg["remember"] = acct["user"] if remember else ""
+        user_var.set(acct.get("mc_name") or acct["user"])
+        chip_var.set(acct["user"] + ("  ★" if acct.get("role") == "admin" else ""))
+        acc_lbl.set(f"{acct['user']}  ·  {'Administrador' if acct.get('role') == 'admin' else 'Usuario'}")
+        topbar.pack(side="top", fill="x", before=content)
+        admin_btn.pack_forget()
+        if acct.get("role") == "admin":
+            admin_btn.pack(side="right", padx=px(6), ipadx=px(10), ipady=px(6))
+        lp.set("")
+        lp2.set("")
+        audit_event("inicio de sesión")
+        save_all()
+        refresh_all()
+        show_page("play")
+
+    def login_submit():
+        mode = login_state["mode"]
+        u, pw = lu.get().strip(), lp.get()
+        accts = cfg["accounts"]
+        if mode in ("setup", "signup"):
+            if mode == "signup" and not cfg.get("allow_signup", True):
+                login_err.config(text="El registro está desactivado por el administrador.")
+                return
+            if pw != lp2.get():
+                login_err.config(text="Las contraseñas no coinciden.")
+                return
+            err = validate_new_account(accts, u, pw)
+            if err:
+                login_err.config(text=err)
+                return
+            role = "admin" if (mode == "setup" or not accts) else "user"
+            acct = new_account(u, pw, role)
+            accts.append(acct)
+            audit_add(cfg, u, "cuenta creada", f"rol: {role}")
+            save_config(cfg)
+            apply_session(acct, remember_v.get())
+            return
+        now = time.time()
+        if now < login_state["until"]:
+            login_err.config(text=f"Demasiados intentos. Esperá {int(login_state['until'] - now) + 1} s.")
+            return
+        acct = find_account(accts, u)
+        if not acct or not check_pw(acct, pw):
+            login_state["fails"] += 1
+            if login_state["fails"] >= 5:
+                login_state["fails"] = 0
+                login_state["until"] = now + 30
+                audit_add(cfg, u or "-", "bloqueo temporal por intentos fallidos")
+                save_config(cfg)
+                login_err.config(text="Demasiados intentos. Esperá 30 s.")
+            else:
+                login_err.config(text="Usuario o contraseña incorrectos.")
+            lp.set("")
+            return
+        if not acct.get("enabled", True):
+            login_err.config(text="Tu cuenta está desactivada. Pedile al administrador que la active.")
+            return
+        login_state["fails"] = 0
+        apply_session(acct, remember_v.get())
+
+    def logout():
+        if state["busy"] and not messagebox.askokcancel(APP_NAME, "Hay algo en marcha. ¿Cerrar sesión igual?"):
+            return
+        audit_event("cierre de sesión")
+        save_all()
+        state["acct"] = None
+        cfg["remember"] = ""
+        save_config(cfg)
+        show_login()
+
+    def start_session():
+        a = find_account(cfg["accounts"], cfg.get("remember", "")) if cfg.get("remember") else None
+        if a and a.get("enabled", True):
+            apply_session(a, True)
+        else:
+            show_login()
+
+    def change_password():
+        a = state.get("acct")
+        if not a:
+            return
+        old = simpledialog.askstring(APP_NAME, "Contraseña actual:", show="•", parent=root)
+        if old is None:
+            return
+        if not check_pw(a, old):
+            messagebox.showwarning(APP_NAME, "La contraseña actual no es correcta.")
+            return
+        new = simpledialog.askstring(APP_NAME, f"Nueva contraseña (mínimo {PW_MIN} caracteres):", show="•",
+                                     parent=root)
+        if not new:
+            return
+        if len(new) < PW_MIN:
+            messagebox.showwarning(APP_NAME, f"La contraseña debe tener al menos {PW_MIN} caracteres.")
+            return
+        a["salt"], a["hash"] = hash_pw(new)
+        audit_event("contraseña cambiada")
+        save_all()
+        messagebox.showinfo(APP_NAME, "Contraseña actualizada.")
+
+    # ================================================================== ADMIN
+    admin_page = tk.Frame(content, bg=BG)
+    pages["admin"] = admin_page
+    ahd = tk.Frame(admin_page, bg=BG)
+    ahd.pack(fill="x", padx=px(36), pady=(px(26), px(2)))
+    page_title(ahd, "Panel de administración").pack(side="left")
+    tk.Label(ahd, text="ADMIN", font=(FONT, 8, "bold"), fg="white", bg="#c0455a").pack(
+        side="left", padx=px(12), pady=(px(10), 0), ipadx=px(8), ipady=px(2))
+    tk.Label(admin_page, text="Las cuentas son locales de este PC: quien tenga acceso a los archivos de la "
+                              "carpeta de datos puede modificarlas.", font=(FONT, 9), fg=MUTED, bg=BG,
+             anchor="w").pack(fill="x", padx=px(38), pady=(0, px(6)))
+    atabs = tk.Frame(admin_page, bg=BG)
+    atabs.pack(fill="x", padx=px(36), pady=(px(4), px(8)))
+    abody = tk.Frame(admin_page, bg=BG)
+    abody.pack(fill="both", expand=True, padx=px(36), pady=(0, px(20)))
+    admin_views, admin_tab_btns, admin_state = {}, {}, {"tab": "accounts"}
+
+    def show_admin_tab(k):
+        admin_state["tab"] = k
+        for key, f in admin_views.items():
+            f.pack_forget()
+        admin_views[k].pack(fill="both", expand=True)
+        for key, b in admin_tab_btns.items():
+            on = key == k
+            b.config(bg=ACCENT if on else CARD, fg="white" if on else FG)
+        {"accounts": build_accounts, "audit": refresh_audit, "system": refresh_system,
+         "global": refresh_global}[k]()
+
+    for k, label in (("accounts", "Cuentas"), ("audit", "Actividad"), ("system", "Sistema"),
+                     ("global", "Global")):
+        admin_views[k] = tk.Frame(abody, bg=BG)
+        b = tk.Button(atabs, text=label, font=(FONT, 10, "bold"), bg=CARD, fg=FG, activebackground=CARD2,
+                      activeforeground=FG, relief="flat", bd=0, cursor="hand2",
+                      command=lambda kk=k: show_admin_tab(kk))
+        b.pack(side="left", padx=(0, px(6)), ipadx=px(20), ipady=px(7))
+        admin_tab_btns[k] = b
+
+    def admin_enter():
+        if is_admin():
+            show_admin_tab(admin_state["tab"])
+
+    # ---- cuentas
+    av = admin_views["accounts"]
+    ar = tk.Frame(av, bg=BG)
+    ar.pack(fill="x", pady=(0, px(8)))
+    flat_btn(ar, "＋  Nueva cuenta", lambda: new_account_dialog(), bg=ACCENT, hover="#7ba3ff", fg="white",
+             size=10).pack(side="left", ipadx=px(16), ipady=px(7))
+    alist = ScrollFrame(av, BG)
+    alist.pack(fill="both", expand=True)
+
+    def admin_guard():
+        return is_admin()
+
+    def toggle_role(a):
+        if not admin_guard():
+            return
+        if is_last_admin(cfg["accounts"], a):
+            messagebox.showwarning(APP_NAME, "No podés quitarle el rol al último administrador.")
+            return
+        a["role"] = "user" if a.get("role") == "admin" else "admin"
+        audit_event("rol cambiado", f"{a['user']} → {a['role']}")
+        save_all()
+        build_accounts()
+
+    def toggle_enabled(a):
+        if not admin_guard():
+            return
+        if a is state["acct"] or is_last_admin(cfg["accounts"], a):
+            messagebox.showwarning(APP_NAME, "No podés desactivar tu propia cuenta ni al último administrador.")
+            return
+        a["enabled"] = not a.get("enabled", True)
+        audit_event("cuenta " + ("activada" if a["enabled"] else "desactivada"), a["user"])
+        save_all()
+        build_accounts()
+
+    def delete_account(a):
+        if not admin_guard():
+            return
+        if a is state["acct"] or is_last_admin(cfg["accounts"], a):
+            messagebox.showwarning(APP_NAME, "No podés eliminar tu propia cuenta ni al último administrador.")
+            return
+        if not messagebox.askokcancel(APP_NAME, f"¿Eliminar la cuenta “{a['user']}”? No se puede deshacer."):
+            return
+        cfg["accounts"] = [x for x in cfg["accounts"] if x is not a]
+        if cfg.get("remember", "").lower() == a["user"].lower():
+            cfg["remember"] = ""
+        audit_event("cuenta eliminada", a["user"])
+        save_all()
+        build_accounts()
+
+    def reset_pw(a):
+        if not admin_guard():
+            return
+        new = simpledialog.askstring(APP_NAME, f"Nueva contraseña para {a['user']}:", show="•", parent=root)
+        if not new:
+            return
+        if len(new) < PW_MIN:
+            messagebox.showwarning(APP_NAME, f"La contraseña debe tener al menos {PW_MIN} caracteres.")
+            return
+        a["salt"], a["hash"] = hash_pw(new)
+        audit_event("contraseña restablecida", a["user"])
+        save_all()
+        messagebox.showinfo(APP_NAME, f"Contraseña de {a['user']} actualizada.")
+
+    def new_account_dialog():
+        if not admin_guard():
+            return
+        u = simpledialog.askstring(APP_NAME, "Nombre de usuario de la nueva cuenta:", parent=root)
+        if not u:
+            return
+        pw = simpledialog.askstring(APP_NAME, f"Contraseña para {u} (mínimo {PW_MIN} caracteres):", show="•",
+                                    parent=root)
+        if pw is None:
+            return
+        err = validate_new_account(cfg["accounts"], u.strip(), pw)
+        if err:
+            messagebox.showwarning(APP_NAME, err)
+            return
+        role = "admin" if messagebox.askyesno(APP_NAME, "¿Hacerla cuenta de administrador?") else "user"
+        cfg["accounts"].append(new_account(u.strip(), pw, role))
+        audit_event("cuenta creada por admin", f"{u.strip()} ({role})")
+        save_all()
+        build_accounts()
+
+    def perms_dialog(a):
+        if not admin_guard():
+            return
+        dlg = tk.Toplevel(root)
+        dlg.title(f"Permisos de {a['user']}")
+        dlg.configure(bg=BG)
+        dlg.transient(root)
+        dlg.geometry(f"{px(440)}x{px(360)}+{root.winfo_x() + px(160)}+{root.winfo_y() + px(120)}")
+        pr = a.get("perms") or {}
+        pv = {k: tk.BooleanVar(value=bool(pr.get(k, True))) for k in ("store", "ai", "console")}
+        ram_v = tk.StringVar(value=str(round(int(pr.get("ram_mb", 0)) / 1024, 1)))
+        tk.Label(dlg, text=f"Permisos de {a['user']}", font=(FONT, 14, "bold"), fg=FG, bg=BG).pack(
+            anchor="w", padx=px(24), pady=(px(20), px(10)))
+        for k, label in (("store", "Puede usar la tienda de mods, texturas y shaders"),
+                         ("ai", "Puede usar el asistente IA"),
+                         ("console", "Puede ver la consola")):
+            tk.Checkbutton(dlg, text=label, variable=pv[k], fg=FG, bg=BG, selectcolor=CARD2,
+                           activebackground=BG, activeforeground=FG, font=(FONT, 10), bd=0,
+                           highlightthickness=0, anchor="w").pack(fill="x", padx=px(24), pady=px(3))
+        tk.Label(dlg, text="Límite de RAM por partida en GB (0 = sin límite)", font=(FONT, 9), fg=MUTED,
+                 bg=BG).pack(anchor="w", padx=px(26), pady=(px(14), px(4)))
+        tk.Entry(dlg, textvariable=ram_v, font=(FONT, 11), bg=CARD2, fg=FG, insertbackground=FG,
+                 relief="flat", highlightthickness=1, highlightbackground=LINE, highlightcolor=ACCENT,
+                 width=10).pack(anchor="w", padx=px(26), ipady=px(6))
+
+        def save():
+            try:
+                gb = float((ram_v.get() or "0").replace(",", "."))
+                if gb < 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showwarning(APP_NAME, "El límite de RAM tiene que ser un número (0 = sin límite).",
+                                       parent=dlg)
+                return
+            a["perms"] = {"store": pv["store"].get(), "ai": pv["ai"].get(), "console": pv["console"].get(),
+                          "ram_mb": int(gb * 1024)}
+            audit_event("permisos modificados", a["user"])
+            save_all()
+            build_accounts()
+            dlg.destroy()
+
+        fr = tk.Frame(dlg, bg=BG)
+        fr.pack(side="bottom", fill="x", padx=px(24), pady=px(18))
+        flat_btn(fr, "Cancelar", dlg.destroy, size=10).pack(side="right", padx=(px(8), 0), ipadx=px(14), ipady=px(7))
+        flat_btn(fr, "Guardar", save, bg=ACCENT, hover="#7ba3ff", fg="white", size=10).pack(
+            side="right", ipadx=px(16), ipady=px(7))
+
+    def build_accounts():
+        for w_ in alist.inner.winfo_children():
+            w_.destroy()
+        for a in cfg["accounts"]:
+            c = card(alist.inner)
+            c.pack(fill="x", pady=(0, px(8)), padx=(0, px(8)))
+            tk.Label(c, text=a["user"][:1].upper(), font=(FONT, 18, "bold"), fg="white",
+                     bg=accent_for(a["user"]), width=3).pack(side="left", fill="y")
+            mid = tk.Frame(c, bg=CARD)
+            mid.pack(side="left", fill="x", expand=True, padx=px(14), pady=px(12))
+            top = tk.Frame(mid, bg=CARD)
+            top.pack(fill="x")
+            tk.Label(top, text=a["user"], font=(FONT, 12, "bold"), fg=FG, bg=CARD).pack(side="left")
+            badges = []
+            if a.get("role") == "admin":
+                badges.append(("ADMIN", ACCENT))
+            if not a.get("enabled", True):
+                badges.append(("DESACTIVADA", "#c0455a"))
+            if a is state["acct"]:
+                badges.append(("VOS", "#2a8a5a"))
+            for txt, col in badges:
+                tk.Label(top, text=txt, font=(FONT, 7, "bold"), fg="white", bg=col).pack(
+                    side="left", padx=(px(8), 0), ipadx=px(5), ipady=px(1))
+            tk.Label(mid, text=f"Minecraft: {a.get('mc_name') or a['user']}  ·  Último acceso: "
+                               f"{a.get('last_login') or 'nunca'}  ·  Jugado: {fmt_time(a.get('playtime', 0))}",
+                     font=(FONT, 9), fg=MUTED, bg=CARD, anchor="w").pack(fill="x")
+            pr = a.get("perms") or {}
+            if a.get("role") == "admin":
+                ptxt = "Acceso total"
+            else:
+                ck = lambda v: "sí" if v else "no"
+                cap = int(pr.get("ram_mb", 0))
+                ptxt = (f"Tienda: {ck(pr.get('store', True))}  ·  IA: {ck(pr.get('ai', True))}  ·  "
+                        f"Consola: {ck(pr.get('console', True))}  ·  RAM máx: "
+                        f"{'sin límite' if cap <= 0 else f'{cap / 1024:.1f} GB'}")
+            tk.Label(mid, text=ptxt, font=(FONT, 9), fg=MUTED, bg=CARD, anchor="w").pack(fill="x")
+            right = tk.Frame(c, bg=CARD)
+            right.pack(side="right", padx=px(10))
+            acts = []
+            if a.get("role") != "admin":
+                acts.append(("Permisos", lambda x=a: perms_dialog(x), CARD2, LINE, FG))
+            acts += [("Clave", lambda x=a: reset_pw(x), CARD2, LINE, FG),
+                     ("Quitar admin" if a.get("role") == "admin" else "Hacer admin", lambda x=a: toggle_role(x),
+                      CARD2, LINE, FG),
+                     ("Activar" if not a.get("enabled", True) else "Desactivar", lambda x=a: toggle_enabled(x),
+                      CARD2, LINE, FG),
+                     ("Eliminar", lambda x=a: delete_account(x), CARD2, RED, "#ff8a9b")]
+            for txt, fn, bgc, hov, fgc in acts:
+                flat_btn(right, txt, fn, bg=bgc, hover=hov, fg=fgc).pack(
+                    side="left", padx=px(2), ipadx=px(8), ipady=px(5))
+
+    # ---- actividad
+    uv = admin_views["audit"]
+    ur = tk.Frame(uv, bg=BG)
+    ur.pack(fill="x", pady=(0, px(8)))
+    audit_text = tk.Text(uv, bg=CARD, fg="#b7bccb", font=("Consolas", 9), relief="flat", wrap="none",
+                         state="disabled", bd=0, padx=px(12), pady=px(10), highlightthickness=1,
+                         highlightbackground=LINE)
+
+    def refresh_audit():
+        lines = [f"{e.get('t', '')}   {e.get('u', '-'):<14} {e.get('e', '')}" +
+                 (f"  ({e['d']})" if e.get("d") else "") for e in reversed(cfg.get("audit", [])[-150:])]
+        audit_text.config(state="normal")
+        audit_text.delete("1.0", "end")
+        audit_text.insert("end", "\n".join(lines) if lines else "Todavía no hay actividad registrada.")
+        audit_text.config(state="disabled")
+
+    def copy_audit():
+        root.clipboard_clear()
+        root.clipboard_append(audit_text.get("1.0", "end"))
+
+    def clear_audit():
+        if messagebox.askokcancel(APP_NAME, "¿Borrar todo el registro de actividad?"):
+            cfg["audit"] = []
+            audit_event("registro de actividad borrado")
+            save_all()
+            refresh_audit()
+
+    for txt, fn in (("Actualizar", lambda: refresh_audit()), ("Copiar", copy_audit), ("Borrar registro", clear_audit)):
+        flat_btn(ur, txt, fn, size=10).pack(side="left", padx=(0, px(6)), ipadx=px(12), ipady=px(6))
+    audit_text.pack(fill="both", expand=True)
+
+    # ---- sistema
+    sv = admin_views["system"]
+    sys_info = tk.StringVar(value="")
+    sr = tk.Frame(sv, bg=BG)
+    sr.pack(fill="x", pady=(0, px(10)))
+
+    def backup_config():
+        if not admin_guard():
+            return
+        save_all()
+        d = os.path.join(ROOT, "backups")
+        os.makedirs(d, exist_ok=True)
+        dest = os.path.join(d, time.strftime("config-%Y%m%d-%H%M%S.json"))
+        shutil.copyfile(CONFIG_FILE, dest)
+        audit_event("copia de seguridad", os.path.basename(dest))
+        save_all()
+        messagebox.showinfo(APP_NAME, f"Copia guardada en:\n{dest}\n\nOjo: incluye cuentas y la clave de la IA.")
+
+    def clear_installers():
+        if not admin_guard():
+            return
+        shutil.rmtree(INSTALLERS, ignore_errors=True)
+        audit_event("instaladores de loaders borrados")
+        save_all()
+        refresh_system()
+
+    for txt, fn in (("Abrir carpeta de datos", lambda: open_folder(ROOT)),
+                    ("Copia de seguridad de la configuración", backup_config),
+                    ("Borrar instaladores descargados", clear_installers),
+                    ("Recalcular tamaños", lambda: refresh_system())):
+        flat_btn(sr, txt, fn, size=10).pack(side="left", padx=(0, px(6)), ipadx=px(12), ipady=px(6))
+    tk.Label(sv, textvariable=sys_info, font=("Consolas", 10), fg=FG, bg=CARD, anchor="nw", justify="left",
+             padx=px(18), pady=px(14), highlightthickness=1, highlightbackground=LINE).pack(fill="both", expand=True)
+
+    def refresh_system():
+        sys_info.set("Calculando tamaños...")
+        insts = [(i["name"], game_dir(i)) for i in instances()]
+
+        def job():
+            sizes = [(nm, dir_size(pth)) for nm, pth in insts]
+            msgs.put(("sizes", sizes, dir_size(ROOT)))
+        threading.Thread(target=job, daemon=True).start()
+
+    def show_sizes(sizes, total):
+        lines = [f"Carpeta de datos: {ROOT}", f"Tamaño total:     {fmt_size(total)}", "",
+                 f"Cuentas: {len(cfg['accounts'])}   Instancias: {len(instances())}", "", "Instancias:"]
+        lines += [f"  {nm:<28} {fmt_size(sz)}" for nm, sz in sizes] or ["  (ninguna)"]
+        sys_info.set("\n".join(lines))
+
+    # ---- global
+    gv = admin_views["global"]
+    signup_v = tk.BooleanVar(value=cfg.get("allow_signup", True))
+    gcard = card(gv)
+    gcard.pack(fill="x")
+    small_title(gcard, "REGISTRO DE CUENTAS").pack(anchor="w", padx=px(20), pady=(px(14), px(4)))
+
+    def on_signup():
+        cfg["allow_signup"] = bool(signup_v.get())
+        audit_event("registro de cuentas " + ("permitido" if cfg["allow_signup"] else "desactivado"))
+        save_all()
+
+    tk.Checkbutton(gcard, text="Permitir que cualquiera cree una cuenta de usuario desde la pantalla de inicio",
+                   variable=signup_v, command=on_signup, fg=FG, bg=CARD, selectcolor=CARD2,
+                   activebackground=CARD, activeforeground=FG, font=(FONT, 10), bd=0, highlightthickness=0,
+                   anchor="w").pack(fill="x", padx=px(16), pady=(px(4), px(16)))
+
+    def refresh_global():
+        signup_v.set(cfg.get("allow_signup", True))
+
     # ================================================================== AJUSTES
     sett = tk.Frame(content, bg=BG)
     pages["settings"] = sett
-    page_title(sett, "Ajustes").pack(anchor="w", padx=px(36), pady=(px(22), px(12)))
+    page_title(sett, "Ajustes").pack(anchor="w", padx=px(36), pady=(px(28), px(14)))
     c1 = card(sett)
-    c1.pack(fill="x", padx=px(36), pady=(0, px(12)))
-    small_title(c1, "NOMBRE DE USUARIO").pack(anchor="w", padx=px(20), pady=(px(14), px(6)))
+    c1.pack(fill="x", padx=px(36), pady=(0, px(14)))
+    small_title(c1, "NOMBRE EN MINECRAFT").pack(anchor="w", padx=px(20), pady=(px(14), px(6)))
     tk.Entry(c1, textvariable=user_var, font=(FONT, 12), bg=CARD2, fg=FG, insertbackground=FG,
              relief="flat", highlightthickness=1, highlightbackground=LINE,
              highlightcolor=ACCENT).pack(fill="x", padx=px(20), pady=(0, px(16)), ipady=px(7))
 
     c2 = card(sett)
-    c2.pack(fill="x", padx=px(36), pady=(0, px(12)))
+    c2.pack(fill="x", padx=px(36), pady=(0, px(14)))
     small_title(c2, "TAMAÑO DE LA INTERFAZ").pack(anchor="w", padx=px(20), pady=(px(14), px(6)))
     srow = tk.Frame(c2, bg=CARD)
     srow.pack(fill="x", padx=px(20), pady=(0, px(16)))
@@ -1741,8 +2559,20 @@ def run_gui():
     tk.Label(srow, text="Se aplica al reiniciar el launcher. Subilo si se ve chico o borroso.",
              font=(FONT, 9), fg=MUTED, bg=CARD).pack(side="left", padx=px(14))
 
+    cacc = card(sett)
+    cacc.pack(fill="x", padx=px(36), pady=(0, px(14)))
+    small_title(cacc, "MI CUENTA").pack(anchor="w", padx=px(20), pady=(px(14), px(6)))
+    acc_lbl = tk.StringVar(value="")
+    tk.Label(cacc, textvariable=acc_lbl, font=(FONT, 11), fg=FG, bg=CARD, anchor="w").pack(fill="x", padx=px(20))
+    arow = tk.Frame(cacc, bg=CARD)
+    arow.pack(fill="x", padx=px(20), pady=(px(10), px(16)))
+    flat_btn(arow, "Cambiar contraseña", lambda: change_password(), size=10).pack(
+        side="left", ipadx=px(14), ipady=px(7))
+    flat_btn(arow, "Cerrar sesión", lambda: logout(), bg=CARD2, hover=RED, fg="#ff8a9b", size=10).pack(
+        side="left", padx=px(8), ipadx=px(14), ipady=px(7))
+
     c3 = card(sett)
-    c3.pack(fill="x", padx=px(36), pady=(0, px(12)))
+    c3.pack(fill="x", padx=px(36), pady=(0, px(14)))
     small_title(c3, "OPCIONES").pack(anchor="w", padx=px(20), pady=(px(14), px(4)))
 
     def check(parent, text, var, cmd=None):
@@ -1756,18 +2586,14 @@ def run_gui():
     check(c3, "Minimizar el launcher mientras juego", min_var)
     check(c3, "Mostrar la consola al iniciar el juego", con_var)
     tk.Frame(c3, bg=CARD, height=px(10)).pack()
-    drow = tk.Frame(sett, bg=BG)
-    drow.pack(fill="x", padx=px(36), pady=(px(4), 0))
-    tk.Label(drow, text=f"Datos guardados en:  {ROOT}", font=(FONT, 9), fg=MUTED, bg=BG,
-             anchor="w").pack(side="left")
-    flat_btn(drow, "Abrir carpeta", lambda: open_folder(ROOT)).pack(
-        side="left", padx=px(12), ipadx=px(10), ipady=px(4))
+    tk.Label(sett, text=f"Datos guardados en:  {ROOT}", font=(FONT, 9), fg=MUTED, bg=BG,
+             anchor="w").pack(fill="x", padx=px(38), pady=(px(4), 0))
 
     # ================================================================== CONSOLA
     cons = tk.Frame(content, bg=BG)
     pages["console"] = cons
     head = tk.Frame(cons, bg=BG)
-    head.pack(fill="x", padx=px(36), pady=(px(22), px(10)))
+    head.pack(fill="x", padx=px(36), pady=(px(28), px(12)))
     page_title(head, "Consola").pack(side="left")
     log_text = tk.Text(cons, bg=CARD, fg="#b7bccb", font=("Consolas", 9), relief="flat",
                        wrap="word", state="disabled", bd=0, padx=px(12), pady=px(10),
@@ -1783,12 +2609,13 @@ def run_gui():
         log_text.delete("1.0", "end")
         log_text.config(state="disabled")
 
-    for label, fn in (("Limpiar", clear_log), ("Copiar todo", copy_log)):
+    for label, fn in (("✧ Pedir ayuda a la IA", lambda: ai_analyze_log()), ("Limpiar", clear_log),
+                      ("Copiar todo", copy_log)):
         flat_btn(head, label, fn).pack(side="right", padx=(px(8), 0), ipadx=px(12), ipady=px(5))
     sb = tk.Scrollbar(cons, command=log_text.yview)
     log_text.configure(yscrollcommand=sb.set)
-    sb.pack(side="right", fill="y", padx=(0, px(36)), pady=(0, px(14)))
-    log_text.pack(side="left", fill="both", expand=True, padx=(px(36), 0), pady=(0, px(14)))
+    sb.pack(side="right", fill="y", padx=(0, px(36)), pady=(0, px(28)))
+    log_text.pack(side="left", fill="both", expand=True, padx=(px(36), 0), pady=(0, px(28)))
 
     def append_log(text):
         log_text.config(state="normal")
@@ -1796,16 +2623,54 @@ def run_gui():
         log_text.see("end")
         log_text.config(state="disabled")
 
-    # ================================================================== refresco
+    # ================================================================== navegación / refresco
+    def show_page(name):
+        gate = {"mods": ("store", "la tienda"), "ai": ("ai", "el asistente IA"), "console": ("console", "la consola")}
+        if name in gate and not allowed(gate[name][0]):
+            messagebox.showinfo(APP_NAME, f"Tu cuenta no tiene permiso para usar {gate[name][1]}. "
+                                          "Pedile acceso al administrador.")
+            return
+        if name == "admin" and not is_admin():
+            return
+        for f in pages.values():
+            f.pack_forget()
+        state["page"] = name
+        pages[name].pack(fill="both", expand=True)
+        if name in ("play", "login"):
+            back_btn.pack_forget()
+        else:
+            back_btn.pack(side="left", padx=(px(12), 0), before=brand)
+        if name == "mods":
+            mods_enter()
+        elif name == "ai":
+            ai_enter()
+        elif name == "admin":
+            admin_enter()
+
+    def show_console_if_allowed():
+        if allowed("console"):
+            show_page("console")
+
     def refresh_play():
-        inst_box["values"] = [i["name"] for i in instances()]
+        names = [i["name"] for i in instances()]
+        inst_box["values"] = names
         inst = cur()
-        sel_var.set(inst["name"] if inst else "")
-        draw_scene()
+        if inst:
+            sel_var.set(inst["name"])
+            ram_text.set(f"{inst.get('ram_mb', 4096) / 1024:.1f} GB")
+            loader_text.set(LOADER_NAMES.get(inst["loader"], inst["loader"]))
+            time_text.set(fmt_time(inst.get("playtime", 0)))
+        else:
+            time_text.set("—")
+            sel_var.set("")
+            ram_text.set("—")
+            loader_text.set("—")
+        draw_hero()
 
     def refresh_all():
         refresh_play()
         build_instances()
+        refresh_home()
 
     def on_pick(_=None):
         for i in instances():
@@ -1820,6 +2685,9 @@ def run_gui():
                    snapshots=snap_var.get(), old=old_var.get(), minimize=min_var.get(),
                    show_console=con_var.get(),
                    ui_scale=0 if scale_var.get() == SCALES[0] else int(scale_var.get().rstrip("%")))
+        a = state.get("acct")
+        if a:
+            a["mc_name"] = user_var.get().strip() or a["user"]
         save_config(cfg)
 
     # ================================================================== diálogo de instancia
@@ -2019,16 +2887,17 @@ def run_gui():
 
         flat_btn(footer, "Cancelar", dlg.destroy, size=10).pack(side="right", padx=(px(8), 0),
                                                                  ipadx=px(16), ipady=px(8))
-        flat_btn(footer, "Guardar" if editing else "Crear instancia", save, bg=ACCENT, hover=ACCENT_H,
+        flat_btn(footer, "Guardar" if editing else "Crear instancia", save, bg=ACCENT, hover="#7ba3ff",
                  fg="white", size=10).pack(side="right", ipadx=px(18), ipady=px(8))
         load_lv()
 
     # ================================================================== jugar
-    def worker(inst, username):
+    def worker(inst, username, ram_cap=0):
         launcher = Launcher(
             log=lambda t: msgs.put(("log", t)),
             progress=lambda dn, t, l: msgs.put(("progress", dn, t, l)),
             on_change=lambda: msgs.put(("save",)),
+            ram_cap=ram_cap,
         )
         try:
             proc = launcher.launch(inst, username, state["manifest"])
@@ -2063,10 +2932,13 @@ def run_gui():
             show_page("settings")
             return
         save_all()
+        audit_event("jugar", inst["name"])
+        acct = state.get("acct") or {}
+        ram_cap = 0 if is_admin() else int((acct.get("perms") or {}).get("ram_mb", 0))
         state["busy"] = True
-        play_btn.set_state("Preparando…", False)
+        play_btn.set_state("PREPARANDO...", False)
         status_var.set("Preparando...")
-        threading.Thread(target=worker, args=(inst, name), daemon=True).start()
+        threading.Thread(target=worker, args=(inst, name, ram_cap), daemon=True).start()
 
     play_btn.command = on_play
 
@@ -2074,16 +2946,10 @@ def run_gui():
         try:
             state["manifest"] = load_manifest()
             msgs.put(("manifest",))
-            msgs.put(("net", "mojang", True))
         except Exception as e:
+            msgs.put(("net", "mojang", False))
             msgs.put(("log", f"No se pudo cargar la lista de versiones: {e}"))
             msgs.put(("status", "Sin conexión con Mojang"))
-            msgs.put(("net", "mojang", False))
-        try:
-            fetch_json(MODRINTH, timeout=10)
-            msgs.put(("net", "modrinth", True))
-        except Exception:
-            msgs.put(("net", "modrinth", False))
 
     def pump():
         try:
@@ -2101,6 +2967,7 @@ def run_gui():
                     if label:
                         status_var.set(f"Descargando {label.lower()}:  {dn} / {t}")
                 elif kind == "manifest":
+                    status_vals["mojang"] = True
                     if not instances():
                         latest = (state["manifest"] or {}).get("latest", {}).get("release")
                         if latest:
@@ -2110,9 +2977,6 @@ def run_gui():
                             save_all()
                     refresh_all()
                     status_var.set("Listo para jugar")
-                elif kind == "net":
-                    state["net"][m[1]] = m[2]
-                    draw_scene()
                 elif kind == "lv":
                     if state["lv_cb"]:
                         state["lv_cb"](m[1], m[2])
@@ -2123,11 +2987,14 @@ def run_gui():
                     i = get_inst(m[1])
                     if i:
                         i["playtime"] = int(i.get("playtime", 0)) + m[2]
+                        if state.get("acct") is not None:
+                            state["acct"]["playtime"] = int(state["acct"].get("playtime", 0)) + m[2]
+                        audit_event("sesión de juego", f"{i['name']} · {fmt_time(m[2])}")
                         save_all()
                         refresh_all()
                 elif kind == "crash":
-                    status_var.set(f"El juego se cerró con error (código {m[1]}). Revisá la consola.")
-                    show_page("console")
+                    status_var.set(f"El juego se cerró con error (código {m[1]}). Tocá “Pedir ayuda a la IA”.")
+                    show_console_if_allowed()
                 elif kind == "mods":
                     show_hits(m[1], m[2])
                 elif kind == "modinst":
@@ -2141,25 +3008,28 @@ def run_gui():
                         append_log("Instalado: " + ", ".join(m[2]))
                 elif kind == "quick":
                     finish_quick(m[1], m[2], m[3])
+                elif kind == "ai":
+                    ai_done(m[1])
+                elif kind == "sizes":
+                    show_sizes(m[1], m[2])
+                elif kind == "net":
+                    status_vals[m[1]] = m[2]
+                    refresh_home()
                 elif kind == "started":
                     bar["value"] = 0
-                    state["playing"] = m[1]
-                    play_btn.set_state("Jugando", False)
+                    play_btn.set_state("JUGANDO", False)
                     status_var.set(f"{m[1]} en ejecución")
-                    draw_scene()
                     if con_var.get():
-                        show_page("console")
+                        show_console_if_allowed()
                     if min_var.get():
                         root.iconify()
                 elif kind == "error":
                     status_var.set("Error: revisá la consola")
-                    show_page("console")
+                    show_console_if_allowed()
                 elif kind == "idle":
                     state["busy"] = False
-                    state["playing"] = ""
                     bar["value"] = 0
-                    play_btn.set_state("▶  Jugar", True)
-                    draw_scene()
+                    play_btn.set_state("JUGAR", True)
                     if min_var.get():
                         root.deiconify()
         except queue.Empty:
@@ -2175,9 +3045,17 @@ def run_gui():
 
     root.protocol("WM_DELETE_WINDOW", on_close)
     refresh_all()
-    show_page("play")
     pump()
+    start_session()
     threading.Thread(target=load_versions, daemon=True).start()
+
+    def ping_modrinth():
+        try:
+            fetch_json("https://api.modrinth.com/", timeout=10)
+            msgs.put(("net", "modrinth", True))
+        except Exception:
+            msgs.put(("net", "modrinth", False))
+    threading.Thread(target=ping_modrinth, daemon=True).start()
     append_log(f"Datos guardados en: {ROOT}")
     root.mainloop()
 
